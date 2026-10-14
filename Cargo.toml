@@ -1,5 +1,5 @@
 [package]
-name = "wayclone"
+name = "waysync"
 version = "0.1.0"
 edition = "2021"
 description = "Declarative dotfile & package manager for Arch-based systems"

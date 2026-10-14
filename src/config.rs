@@ -37,10 +37,6 @@ impl AppConfig {
         self.repo_dir.join("dotfiles")
     }
 
-    pub fn packages_dir(&self) -> PathBuf {
-        self.repo_dir.join("packages")
-    }
-
     pub fn overlay_dir(&self, shell: &str) -> PathBuf {
         self.repo_dir.join(format!("overlays/{}", shell))
     }

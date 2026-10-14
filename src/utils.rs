@@ -22,15 +22,17 @@ pub enum FileSource {
 pub fn expand_env(s: &str) -> String {
     let home = std::env::var("HOME").unwrap_or_default();
     let get_var = |name: &str| -> String {
-        std::env::var(name).unwrap_or_else(|_| match name {
-            "XDG_CONFIG_HOME" => format!("{}/.config", home),
-            "XDG_DATA_HOME" => format!("{}/.local/share", home),
-            "XDG_STATE_HOME" => format!("{}/.local/state", home),
-            "XDG_CACHE_HOME" => format!("{}/.cache", home),
-            "HOME" => home.clone(),
-            _ => String::new(),
-        })
-    };
+            std::env::var(name).unwrap_or_else(|_| match name {
+                "XDG_CONFIG_HOME" => format!("{}/.config", home),
+                "XDG_DATA_HOME" => format!("{}/.local/share", home),
+                "XDG_STATE_HOME" => format!("{}/.local/state", home),
+                "XDG_CACHE_HOME" => format!("{}/.cache", home),
+                "XDG_BIN_HOME" => format!("{}/.local/bin", home),
+                "XDG_CONFIG_SERVICE" => format!("{}/.config/systemd/user", home),
+                "HOME" => home.clone(),
+                _ => String::new(),
+            })
+        };
 
     let mut result = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
@@ -78,13 +80,6 @@ pub fn expand_env(s: &str) -> String {
     }
 
     result
-}
-
-/// Compute SHA256 hash of a file's contents.
-pub fn hash_file(path: &Path) -> Result<String> {
-    let contents = fs::read(path)
-        .with_context(|| format!("Failed to read file for hashing: {}", path.display()))?;
-    Ok(hash_contents(&contents))
 }
 
 /// Compute SHA256 hash of a byte slice.
@@ -174,7 +169,7 @@ pub fn copy_file(src: &Path, dest: &Path, sudo: bool) -> Result<()> {
         if let Some(parent) = dest.parent() {
             run_cmd("sudo", &["mkdir", "-p", &parent.to_string_lossy()])?;
         }
-        run_cmd("sudo", &["cp", &src.to_string_lossy(), &dest.to_string_lossy()])?;
+        run_cmd("sudo", &["cp", "-p", &src.to_string_lossy(), &dest.to_string_lossy()])?;
     } else {
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent)

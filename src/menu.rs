@@ -1,236 +1,558 @@
+use std::collections::{HashMap, HashSet};
+
 use anyhow::Result;
-use console::style;
-use dialoguer::{theme::ColorfulTheme, MultiSelect, Select};
+use console::{style, Key, Term};
 
 use crate::manifest::{Component, Manifest};
 use crate::state::State;
 
-/// Main menu actions.
 pub enum MainMenuAction {
     ManageComponents,
-    ChangeShell,
+    ChangeEnvironment,
     UpdateRepo,
     Status,
     Exit,
 }
 
-/// Result of the component selection menu.
 pub struct ComponentSelection {
-    /// Names of components the user wants enabled.
     pub enabled: Vec<String>,
-    /// Names of components the user wants disabled.
     pub disabled: Vec<String>,
-    /// If true, reinstall all packages (no --needed).
     pub reinstall: bool,
 }
 
-/// Show the main menu and return the selected action.
-pub fn show_main_menu(manifest: &Manifest) -> Result<MainMenuAction> {
-    let has_shells = manifest.shells.is_some();
+/// Clear visible screen, scrollback buffer, and print a clean TUI header.
+pub fn render_header(term: &Term, subtitle: &str) -> Result<()> {
+    // \x1b[2J = clear screen, \x1b[3J = clear scrollback buffer, \x1b[H = cursor to top-left
+    print!("\x1b[2J\x1b[3J\x1b[H");
+    term.flush()?;
+    println!(
+        "  {} {}",
+        style("wayclone").cyan().bold(),
+        style(format!("── {}", subtitle)).dim()
+    );
+    println!(
+        "  {}\n",
+        style("────────────────────────────────────────────────────────").dim()
+    );
+    Ok(())
+}
+
+/// Wait for the user to press Enter/Space/Esc before clearing the screen again.
+pub fn wait_for_enter() -> Result<()> {
+    let term = Term::stdout();
+    println!(
+        "\n  {}",
+        style("Press Enter to return to the menu...").dim()
+    );
+    loop {
+        match term.read_key()? {
+            Key::Enter | Key::Escape | Key::Char(' ') | Key::Char('q') => break,
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Interactive Main Menu.
+pub fn show_main_menu(manifest: &Manifest, active_env: Option<&str>) -> Result<MainMenuAction> {
+    let term = Term::stdout();
+    let _ = term.hide_cursor();
+    let res = main_menu_loop(&term, manifest, active_env);
+    let _ = term.show_cursor();
+    res
+}
+
+fn main_menu_loop(
+    term: &Term,
+    manifest: &Manifest,
+    active_env: Option<&str>,
+) -> Result<MainMenuAction> {
+    let has_envs = manifest.environments.is_some();
 
     let mut items = vec!["📦 Manage Components"];
-    if has_shells {
-        items.push("🐚 Change Shell");
+    if has_envs {
+        items.push("🖥️ Change Environment");
     }
     items.extend_from_slice(&["🔄 Update Repository", "📊 Status", "🚪 Exit"]);
 
-    let selection = Select::with_theme(&ColorfulTheme::default())
-        .with_prompt(format!("{}", style("wayclone").cyan().bold()))
-        .items(&items)
-        .default(0)
-        .interact()?;
+    let mut cursor = 0;
 
-    // Map selection index back to action accounting for optional shell entry
-    if has_shells {
-        Ok(match selection {
-            0 => MainMenuAction::ManageComponents,
-            1 => MainMenuAction::ChangeShell,
-            2 => MainMenuAction::UpdateRepo,
-            3 => MainMenuAction::Status,
-            _ => MainMenuAction::Exit,
-        })
-    } else {
-        Ok(match selection {
-            0 => MainMenuAction::ManageComponents,
-            1 => MainMenuAction::UpdateRepo,
-            2 => MainMenuAction::Status,
-            _ => MainMenuAction::Exit,
-        })
+    loop {
+        render_header(term, "Main Menu")?;
+
+        if has_envs {
+            let env_label = active_env.unwrap_or("none");
+            println!("  Environment: {}\n", style(env_label).cyan().bold());
+        }
+
+        for (i, item) in items.iter().enumerate() {
+            let prefix = if i == cursor {
+                style("❯").cyan().bold()
+            } else {
+                style(" ").dim()
+            };
+            let label = if i == cursor {
+                style(*item).cyan().bold()
+            } else {
+                style(*item)
+            };
+            println!("  {} {}", prefix, label);
+        }
+
+        println!(
+            "\n  {}",
+            style("↑/↓: Navigate  •  Enter: Select  •  q/Esc: Exit").dim()
+        );
+
+        match term.read_key()? {
+            Key::ArrowUp | Key::Char('k') => {
+                cursor = if cursor == 0 { items.len() - 1 } else { cursor - 1 };
+            }
+            Key::ArrowDown | Key::Char('j') => {
+                cursor = (cursor + 1) % items.len();
+            }
+            Key::Enter | Key::ArrowRight | Key::Char('l') => {
+                if has_envs {
+                    return Ok(match cursor {
+                        0 => MainMenuAction::ManageComponents,
+                        1 => MainMenuAction::ChangeEnvironment,
+                        2 => MainMenuAction::UpdateRepo,
+                        3 => MainMenuAction::Status,
+                        _ => MainMenuAction::Exit,
+                    });
+                } else {
+                    return Ok(match cursor {
+                        0 => MainMenuAction::ManageComponents,
+                        1 => MainMenuAction::UpdateRepo,
+                        2 => MainMenuAction::Status,
+                        _ => MainMenuAction::Exit,
+                    });
+                }
+            }
+            Key::Escape | Key::Char('q') => return Ok(MainMenuAction::Exit),
+            _ => {}
+        }
     }
 }
 
-/// Show the component selection menu with categories.
-/// Components are grouped by category and displayed as `category/name`.
+/// Interactive Categories & Components TUI.
+/// - Space on a category enables all (if none/partial) or disables all (if all enabled).
+/// - Enter on a category opens the component checkboxes directly.
 pub fn show_components_menu(
     components: &[&Component],
     state: &State,
 ) -> Result<Option<ComponentSelection>> {
     if components.is_empty() {
-        println!("No components available.");
         return Ok(None);
     }
 
-    let is_first_run = state.is_first_run();
+    let term = Term::stdout();
+    let _ = term.hide_cursor();
+    let res = components_menu_loop(&term, components, state);
+    let _ = term.show_cursor();
+    res
+}
 
-    // Group components by category, maintaining order of first appearance
+fn components_menu_loop(
+    term: &Term,
+    components: &[&Component],
+    state: &State,
+) -> Result<Option<ComponentSelection>> {
     let mut category_order: Vec<String> = Vec::new();
-    let mut by_category: std::collections::HashMap<String, Vec<&Component>> =
-        std::collections::HashMap::new();
+    let mut by_category: HashMap<String, Vec<&Component>> = HashMap::new();
 
     for comp in components {
-        let cat = comp
-            .category
-            .as_deref()
-            .unwrap_or("general")
-            .to_string();
+        let cat = comp.category.as_deref().unwrap_or("general").to_string();
         if !by_category.contains_key(&cat) {
             category_order.push(cat.clone());
         }
         by_category.entry(cat).or_default().push(comp);
     }
 
-    // Build display items and defaults
-    let mut items: Vec<String> = Vec::new();
-    let mut defaults: Vec<bool> = Vec::new();
-    let mut names: Vec<String> = Vec::new();
+    let mut enabled_set: HashSet<String> = HashSet::new();
+    for comp in components {
+        let is_on = state
+            .components
+            .get(&comp.name)
+            .copied()
+            .unwrap_or(comp.default);
+        if is_on {
+            enabled_set.insert(comp.name.clone());
+        }
+    }
 
-    for cat in &category_order {
-        let comps = &by_category[cat];
-        for comp in comps {
-            let enabled = if is_first_run {
-                comp.default
+    let mut reinstall = false;
+    let mut cursor = 0;
+    let total_rows = category_order.len() + 2; // Categories + Reinstall + Save
+
+    loop {
+        render_header(term, "Manage Components")?;
+
+        for (i, cat) in category_order.iter().enumerate() {
+            let comps = &by_category[cat];
+            let enabled_count = comps
+                .iter()
+                .filter(|c| enabled_set.contains(&c.name))
+                .count();
+            let total_count = comps.len();
+
+            let is_selected = i == cursor;
+            let pointer = if is_selected {
+                style("❯").cyan().bold()
             } else {
-                state.is_enabled(&comp.name)
+                style(" ").dim()
             };
 
-            let shell_tag = comp
-                .shell
-                .as_ref()
-                .map(|s| format!(" {}", style(format!("[{}]", s)).dim()))
-                .unwrap_or_default();
+            let checkbox = if enabled_count == total_count {
+                style("[✓]").green().bold()
+            } else if enabled_count > 0 {
+                style("[~]").yellow().bold()
+            } else {
+                style("[ ]").dim()
+            };
 
-            let pkg_count = comp.packages.len();
-            let file_count = comp.files.len();
-            let meta = format!(
-                " {}",
-                style(format!("({}pkg, {}files)", pkg_count, file_count)).dim()
-            );
+            let cat_name = if is_selected {
+                style(format!("{:<15}", cat)).cyan().bold()
+            } else {
+                style(format!("{:<15}", cat))
+            };
 
-            items.push(format!("{}/{}{}{}", cat, comp.name, shell_tag, meta));
-            defaults.push(enabled);
-            names.push(comp.name.clone());
+            let count_badge = style(format!("({}/{})", enabled_count, total_count)).dim();
+
+            println!("  {} {} 📁 {} {}", pointer, checkbox, cat_name, count_badge);
         }
-    }
 
-    // Add reinstall toggle at the end
-    items.push(format!(
-        "{}",
-        style("⟳ Reinstall (force reinstall all packages)").yellow()
-    ));
-    defaults.push(false);
+        println!();
 
-    let selected = MultiSelect::with_theme(&ColorfulTheme::default())
-        .with_prompt("Select components (↑↓ navigate, space toggle, enter confirm)")
-        .items(&items)
-        .defaults(&defaults)
-        .interact_opt()?;
-
-    let selected = match selected {
-        Some(s) => s,
-        None => return Ok(None), // User pressed Escape
-    };
-
-    let reinstall = selected.contains(&(items.len() - 1));
-
-    let mut enabled = Vec::new();
-    let mut disabled = Vec::new();
-
-    for (i, name) in names.iter().enumerate() {
-        if selected.contains(&i) {
-            enabled.push(name.clone());
+        // Action 1: Reinstall toggle
+        let reinstall_idx = category_order.len();
+        let p_reinstall = if cursor == reinstall_idx {
+            style("❯").cyan().bold()
         } else {
-            disabled.push(name.clone());
+            style(" ").dim()
+        };
+        let c_reinstall = if reinstall {
+            style("[✓]").yellow().bold()
+        } else {
+            style("[ ]").dim()
+        };
+        let l_reinstall = if cursor == reinstall_idx {
+            style("Reinstall")
+                .yellow()
+                .bold()
+        } else {
+            style("Reinstall").yellow()
+        };
+        println!("  {} {} {}", p_reinstall, c_reinstall, l_reinstall);
+
+        // Action 2: Save & Apply
+        let save_idx = category_order.len() + 1;
+        let p_save = if cursor == save_idx {
+            style("❯").cyan().bold()
+        } else {
+            style(" ").dim()
+        };
+        let l_save = if cursor == save_idx {
+            style("💾 Save & Apply").green().bold()
+        } else {
+            style("💾 Save & Apply").green()
+        };
+        println!("  {} {}", p_save, l_save);
+
+        println!(
+            "\n  {}",
+            style("↑/↓: Navigate  •  Space: Toggle All  •  Enter: Open / Confirm  •  Esc: Cancel")
+                .dim()
+        );
+
+        match term.read_key()? {
+            Key::ArrowUp | Key::Char('k') => {
+                cursor = if cursor == 0 { total_rows - 1 } else { cursor - 1 };
+            }
+            Key::ArrowDown | Key::Char('j') => {
+                cursor = (cursor + 1) % total_rows;
+            }
+            Key::Char(' ') => {
+                if cursor < category_order.len() {
+                    let cat = &category_order[cursor];
+                    let comps = &by_category[cat];
+                    let all_enabled = comps.iter().all(|c| enabled_set.contains(&c.name));
+                    if all_enabled {
+                        for comp in comps {
+                            enabled_set.remove(&comp.name);
+                        }
+                    } else {
+                        for comp in comps {
+                            enabled_set.insert(comp.name.clone());
+                        }
+                    }
+                } else if cursor == reinstall_idx {
+                    reinstall = !reinstall;
+                }
+            }
+            Key::Enter | Key::ArrowRight | Key::Char('l') => {
+                if cursor < category_order.len() {
+                    let cat = &category_order[cursor];
+                    let comps = &by_category[cat];
+                    category_components_loop(term, cat, comps, &mut enabled_set)?;
+                } else if cursor == reinstall_idx {
+                    reinstall = !reinstall;
+                } else if cursor == save_idx {
+                    let mut enabled = Vec::new();
+                    let mut disabled = Vec::new();
+                    for comp in components {
+                        if enabled_set.contains(&comp.name) {
+                            enabled.push(comp.name.clone());
+                        } else {
+                            disabled.push(comp.name.clone());
+                        }
+                    }
+                    return Ok(Some(ComponentSelection {
+                        enabled,
+                        disabled,
+                        reinstall,
+                    }));
+                } else {
+                    return Ok(None);
+                }
+            }
+            Key::Escape | Key::Char('q') => return Ok(None),
+            _ => {}
         }
     }
-
-    Ok(Some(ComponentSelection {
-        enabled,
-        disabled,
-        reinstall,
-    }))
 }
 
-/// Show a shell selection menu.
-pub fn show_shell_menu(manifest: &Manifest, current: Option<&str>) -> Result<Option<String>> {
-    let shells = manifest.available_shells();
-    if shells.is_empty() {
-        println!("No shells configured in manifest.");
+/// Direct checkbox list for a specific category.
+fn category_components_loop(
+    term: &Term,
+    category: &str,
+    comps: &[&Component],
+    enabled_set: &mut HashSet<String>,
+) -> Result<()> {
+    let mut cursor = 0;
+    let total_rows = comps.len() + 1; // Components + Back row
+
+    loop {
+        render_header(term, &format!("Category: {}", category))?;
+
+        for (i, comp) in comps.iter().enumerate() {
+            let is_selected = i == cursor;
+            let is_enabled = enabled_set.contains(&comp.name);
+
+            let pointer = if is_selected {
+                style("❯").cyan().bold()
+            } else {
+                style(" ").dim()
+            };
+
+            let checkbox = if is_enabled {
+                style("[✓]").green().bold()
+            } else {
+                style("[ ]").dim()
+            };
+
+            let name = if is_selected {
+                style(&comp.name).cyan().bold()
+            } else {
+                style(&comp.name)
+            };
+
+            let env_tag = comp
+                .environment
+                .as_ref()
+                .map(|e| format!(" {}", style(format!("[{}]", e)).magenta()))
+                .unwrap_or_default();
+
+            let meta = style(format!(
+                " ({} pkg, {} files)",
+                comp.packages.len(),
+                comp.files.len()
+            ))
+            .dim();
+
+            println!("  {} {} {}{}{}", pointer, checkbox, name, env_tag, meta);
+        }
+
+        println!();
+        let back_idx = comps.len();
+        let p_back = if cursor == back_idx {
+            style("❯").cyan().bold()
+        } else {
+            style(" ").dim()
+        };
+        let l_back = if cursor == back_idx {
+            style("↩  Back to Categories").white().bold()
+        } else {
+            style("↩  Back to Categories").dim()
+        };
+        println!("  {} {}", p_back, l_back);
+
+        println!(
+            "\n  {}",
+            style("↑/↓: Navigate  •  Space: Toggle  •  a: Toggle All  •  Enter/Esc: Back").dim()
+        );
+
+        match term.read_key()? {
+            Key::ArrowUp | Key::Char('k') => {
+                cursor = if cursor == 0 { total_rows - 1 } else { cursor - 1 };
+            }
+            Key::ArrowDown | Key::Char('j') => {
+                cursor = (cursor + 1) % total_rows;
+            }
+            Key::Char(' ') => {
+                if cursor < comps.len() {
+                    let name = &comps[cursor].name;
+                    if enabled_set.contains(name) {
+                        enabled_set.remove(name);
+                    } else {
+                        enabled_set.insert(name.clone());
+                    }
+                } else {
+                    break;
+                }
+            }
+            Key::Char('a') => {
+                let all_enabled = comps.iter().all(|c| enabled_set.contains(&c.name));
+                if all_enabled {
+                    for comp in comps {
+                        enabled_set.remove(&comp.name);
+                    }
+                } else {
+                    for comp in comps {
+                        enabled_set.insert(comp.name.clone());
+                    }
+                }
+            }
+            Key::Enter | Key::Escape | Key::ArrowLeft | Key::Char('h') | Key::Char('q') => {
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    Ok(())
+}
+
+/// Interactive Environment Selection Menu.
+pub fn show_environment_menu(
+    manifest: &Manifest,
+    current: Option<&str>,
+) -> Result<Option<Option<String>>> {
+    let envs = manifest.available_environments();
+    if envs.is_empty() {
+        println!("No environments configured in manifest.");
         return Ok(None);
     }
 
-    let current_label = current.unwrap_or("none");
-    let items: Vec<String> = shells
-        .iter()
-        .map(|s| {
-            if Some(*s) == current {
-                format!("{} {}", s, style("(active)").green())
+    let term = Term::stdout();
+    let _ = term.hide_cursor();
+    let res = environment_menu_loop(&term, &envs, current);
+    let _ = term.show_cursor();
+    res
+}
+
+fn environment_menu_loop(
+    term: &Term,
+    envs: &[&str],
+    current: Option<&str>,
+) -> Result<Option<Option<String>>> {
+    let mut cursor = match current {
+        None => 0,
+        Some(c) => envs
+            .iter()
+            .position(|e| *e == c)
+            .map(|idx| idx + 1)
+            .unwrap_or(0),
+    };
+
+    let total_rows = envs.len() + 1;
+
+    loop {
+        render_header(term, "Select Environment")?;
+
+        let current_label = current.unwrap_or("none");
+        println!("  Current: {}\n", style(current_label).cyan().bold());
+
+        for i in 0..total_rows {
+            let is_selected = i == cursor;
+            let pointer = if is_selected {
+                style("❯").cyan().bold()
             } else {
-                s.to_string()
+                style(" ").dim()
+            };
+
+            let (name, is_active) = if i == 0 {
+                ("none", current.is_none())
+            } else {
+                let env_name = envs[i - 1];
+                (env_name, current == Some(env_name))
+            };
+
+            let styled_name = if is_selected {
+                style(name).cyan().bold()
+            } else {
+                style(name)
+            };
+
+            let active_badge = if is_active {
+                format!(" {}", style("(active)").green())
+            } else {
+                String::new()
+            };
+
+            println!("  {} {}{}", pointer, styled_name, active_badge);
+        }
+
+        println!(
+            "\n  {}",
+            style("↑/↓: Navigate  •  Enter: Select  •  Esc: Cancel").dim()
+        );
+
+        match term.read_key()? {
+            Key::ArrowUp | Key::Char('k') => {
+                cursor = if cursor == 0 { total_rows - 1 } else { cursor - 1 };
             }
-        })
-        .collect();
-
-    let default = current
-        .and_then(|c| shells.iter().position(|s| *s == c))
-        .unwrap_or(0);
-
-    println!(
-        "Current shell: {}",
-        style(current_label).cyan().bold()
-    );
-
-    let selection = Select::with_theme(&ColorfulTheme::default())
-        .with_prompt("Select shell")
-        .items(&items)
-        .default(default)
-        .interact_opt()?;
-
-    match selection {
-        Some(idx) => Ok(Some(shells[idx].to_string())),
-        None => Ok(None),
+            Key::ArrowDown | Key::Char('j') => {
+                cursor = (cursor + 1) % total_rows;
+            }
+            Key::Enter => {
+                if cursor == 0 {
+                    return Ok(Some(None));
+                } else {
+                    return Ok(Some(Some(envs[cursor - 1].to_string())));
+                }
+            }
+            Key::Escape | Key::Char('q') => return Ok(None),
+            _ => {}
+        }
     }
 }
 
-/// Display current system status.
 pub fn show_status(manifest: &Manifest, state: &State) {
-    println!("\n{}", style("═══ wayclone status ═══").cyan().bold());
+    println!("\n  {}", style("═══ wayclone status ═══").cyan().bold());
 
     if let Some(ref url) = state.repo_url {
-        println!("Repository: {}", style(url).dim());
+        println!("  Repository: {}", style(url).dim());
     }
-    if let Some(ref shell) = state.active_shell {
-        println!("Active shell: {}", style(shell).cyan().bold());
-    }
+    let env_label = state
+        .active_environment
+        .as_deref()
+        .unwrap_or("none");
+    println!("  Active environment: {}", style(env_label).cyan().bold());
 
-    let active_shell = state.active_shell.as_deref();
-    let components = manifest.components_for_shell(active_shell);
+    let active_env = state.active_environment.as_deref();
+    let components = manifest.components_for_environment(active_env);
 
     if components.is_empty() {
-        println!("No components configured.");
+        println!("  No components configured.");
         return;
     }
 
-    // Group by category
     let mut category_order: Vec<String> = Vec::new();
-    let mut by_category: std::collections::HashMap<String, Vec<&Component>> =
-        std::collections::HashMap::new();
+    let mut by_category: HashMap<String, Vec<&Component>> = HashMap::new();
 
     for comp in &components {
-        let cat = comp
-            .category
-            .as_deref()
-            .unwrap_or("general")
-            .to_string();
+        let cat = comp.category.as_deref().unwrap_or("general").to_string();
         if !by_category.contains_key(&cat) {
             category_order.push(cat.clone());
         }
@@ -253,29 +575,28 @@ pub fn show_status(manifest: &Manifest, state: &State) {
                 .map(|d| d.len())
                 .unwrap_or(0);
 
-            let shell_tag = comp
-                .shell
+            let env_tag = comp
+                .environment
                 .as_ref()
-                .map(|s| format!(" [{}]", s))
+                .map(|e| format!(" [{}]", e))
                 .unwrap_or_default();
 
             if enabled && deployed_count > 0 {
                 println!(
-                    "  {} {}{} {} files deployed",
+                    "    {} {}{} {} files deployed",
                     status_icon,
                     comp.name,
-                    style(&shell_tag).dim(),
+                    style(&env_tag).dim(),
                     style(format!("({})", deployed_count)).dim()
                 );
             } else {
                 println!(
-                    "  {} {}{}",
+                    "    {} {}{}",
                     status_icon,
                     comp.name,
-                    style(&shell_tag).dim()
+                    style(&env_tag).dim()
                 );
             }
         }
     }
-    println!();
 }

@@ -1,4 +1,6 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use anyhow::{bail, Result};
 use console::style;
@@ -20,7 +22,6 @@ pub fn deploy_component_files(
     state: &mut State,
     active_shell: Option<&str>,
 ) -> Result<()> {
-    // Clear previous deployed file list for this component
     let mut deployed_files: Vec<String> = Vec::new();
 
     for file in &component.files {
@@ -203,39 +204,73 @@ fn prompt_diff_action() -> Result<DiffAction> {
     })
 }
 
+/// Check if a file path requires sudo based on the component's file entries.
+fn path_needs_sudo(component: &Component, file_path: &str) -> bool {
+    component.files.iter().any(|f| {
+        let dest = expand_env(&f.dest);
+        file_path.starts_with(&dest) && f.sudo
+    })
+}
+
+/// Clean up empty parent directories up to safe system/user boundaries.
+fn cleanup_empty_parents(file_path: &Path, sudo: bool) {
+    let protected: HashSet<PathBuf> = [
+        "/",
+        "/etc",
+        "/usr",
+        "/usr/bin",
+        "/usr/lib",
+        "/usr/local",
+        "/usr/local/bin",
+        "/usr/share",
+        &expand_env("$HOME"),
+        &expand_env("$XDG_CONFIG_HOME"),
+        &expand_env("$XDG_DATA_HOME"),
+        &expand_env("$XDG_STATE_HOME"),
+        &expand_env("$XDG_CACHE_HOME"),
+    ]
+    .into_iter()
+    .map(PathBuf::from)
+    .collect();
+
+    let mut parent = file_path.parent();
+    while let Some(dir) = parent {
+        if protected.contains(dir) || !dir.exists() {
+            break;
+        }
+
+        let removed = if sudo {
+            Command::new("sudo")
+                .args(["rmdir", "--ignore-fail-on-non-empty"])
+                .arg(dir)
+                .status()
+                .map(|s| s.success() && !dir.exists())
+                .unwrap_or(false)
+        } else {
+            std::fs::remove_dir(dir).is_ok()
+        };
+
+        if removed {
+            parent = dir.parent();
+        } else {
+            break;
+        }
+    }
+}
+
 /// Remove all deployed files for a component.
 pub fn undeploy_component_files(component: &Component, state: &mut State) -> Result<()> {
     if let Some(files) = state.deployed.remove(&component.name) {
         for file_path in &files {
             let path = PathBuf::from(file_path);
+            let needs_sudo = path_needs_sudo(component, file_path);
             if path.exists() {
-                // Determine sudo from the component's file entries
-                let needs_sudo = component.files.iter().any(|f| {
-                    let dest = expand_env(&f.dest);
-                    file_path.starts_with(&dest) && f.sudo
-                });
                 if let Err(e) = remove_path(&path, needs_sudo) {
                     eprintln!("  Warning: failed to remove {}: {}", path.display(), e);
                 }
             }
             state.hashes.remove(file_path);
-        }
-
-        // Try to clean up empty parent directories
-        for file_path in &files {
-            let path = PathBuf::from(file_path);
-            let mut parent = path.parent();
-            while let Some(dir) = parent {
-                if dir == PathBuf::from("/") {
-                    break;
-                }
-                if dir.exists() && dir.read_dir().map(|mut d| d.next().is_none()).unwrap_or(false) {
-                    let _ = std::fs::remove_dir(dir);
-                    parent = dir.parent();
-                } else {
-                    break;
-                }
-            }
+            cleanup_empty_parents(&path, needs_sudo);
         }
     }
     Ok(())
@@ -263,21 +298,23 @@ pub fn redeploy_component_files(
         .get(&component.name)
         .cloned()
         .unwrap_or_default();
-    let new_set: std::collections::HashSet<_> = new_deployed.iter().collect();
+    let new_set: HashSet<_> = new_deployed.iter().collect();
 
     for old_file in &old_deployed {
         if !new_set.contains(old_file) {
             let path = PathBuf::from(old_file);
+            let needs_sudo = path_needs_sudo(component, old_file);
             if path.exists() {
-                let needs_sudo = component.files.iter().any(|f| {
-                    let dest = expand_env(&f.dest);
-                    old_file.starts_with(&dest) && f.sudo
-                });
                 if let Err(e) = remove_path(&path, needs_sudo) {
-                    eprintln!("  Warning: failed to remove orphaned file {}: {}", path.display(), e);
+                    eprintln!(
+                        "  Warning: failed to remove orphaned file {}: {}",
+                        path.display(),
+                        e
+                    );
                 }
             }
             state.hashes.remove(old_file);
+            cleanup_empty_parents(&path, needs_sudo);
         }
     }
 

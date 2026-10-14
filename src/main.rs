@@ -8,6 +8,8 @@ mod repo;
 mod state;
 mod utils;
 
+use std::collections::HashSet;
+
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 use console::style;
@@ -35,12 +37,13 @@ enum Commands {
         /// Git repository URL
         url: String,
     },
-    /// Pull latest changes from the dotfiles repository
+    /// Pull latest changes from the dotfiles repository and sync enabled components
     Update,
     /// Show current system status
     Status,
-    /// Change the active shell
-    Shell,
+    /// Change the active environment (alias: shell)
+    #[command(alias = "shell")]
+    Env,
 }
 
 fn main() -> Result<()> {
@@ -52,7 +55,7 @@ fn main() -> Result<()> {
         Some(Commands::Init { url }) => cmd_init(&config, &url),
         Some(Commands::Update) => cmd_update(&config),
         Some(Commands::Status) => cmd_status(&config),
-        Some(Commands::Shell) => cmd_shell(&config),
+        Some(Commands::Env) => cmd_env(&config),
         None => cmd_interactive(&config),
     }
 }
@@ -69,10 +72,22 @@ fn cmd_init(config: &AppConfig, url: &str) -> Result<()> {
 
     let mut state = State::default();
     state.repo_url = Some(url.to_string());
+
+    if config.manifest_path().exists() {
+        if let Ok(manifest) = Manifest::load(&config.manifest_path()) {
+            if !manifest.available_environments().is_empty() {
+                println!("\n{}", style("Select an initial environment:").cyan().bold());
+                if let Some(env_choice) = menu::show_environment_menu(&manifest, None)? {
+                    state.active_environment = env_choice;
+                }
+            }
+        }
+    }
+
     state.save(&config.state_file)?;
 
     println!(
-        "{}\nRun {} to manage components.",
+        "\n{}\nRun {} to manage components.",
         style("Repository initialized successfully!").green().bold(),
         style("wayclone").cyan()
     );
@@ -83,6 +98,11 @@ fn cmd_update(config: &AppConfig) -> Result<()> {
     ensure_initialized(config)?;
     repo::pull_repo(&config.repo_dir)?;
     println!("{}", style("Repository updated.").green());
+
+    let mut state = State::load(&config.state_file)?;
+    let manifest = Manifest::load(&config.manifest_path())?;
+    sync_enabled_components(config, &manifest, &mut state)?;
+    state.save(&config.state_file)?;
     Ok(())
 }
 
@@ -94,17 +114,15 @@ fn cmd_status(config: &AppConfig) -> Result<()> {
     Ok(())
 }
 
-fn cmd_shell(config: &AppConfig) -> Result<()> {
+fn cmd_env(config: &AppConfig) -> Result<()> {
     ensure_initialized(config)?;
     let mut state = State::load(&config.state_file)?;
     let manifest = Manifest::load(&config.manifest_path())?;
 
-    if let Some(new_shell) = menu::show_shell_menu(&manifest, state.active_shell.as_deref())? {
-        if state.active_shell.as_deref() == Some(new_shell.as_str()) {
-            println!("Shell is already set to {}.", style(&new_shell).cyan());
-            return Ok(());
-        }
-        change_shell(config, &manifest, &mut state, &new_shell)?;
+    if let Some(new_env) =
+        menu::show_environment_menu(&manifest, state.active_environment.as_deref())?
+    {
+        change_environment(config, &manifest, &mut state, new_env.as_deref())?;
         state.save(&config.state_file)?;
     }
     Ok(())
@@ -113,52 +131,108 @@ fn cmd_shell(config: &AppConfig) -> Result<()> {
 fn cmd_interactive(config: &AppConfig) -> Result<()> {
     ensure_initialized(config)?;
     let mut state = State::load(&config.state_file)?;
-    let manifest = Manifest::load(&config.manifest_path())?;
+    let term = console::Term::stdout();
 
-    loop {
-        println!();
-        match menu::show_main_menu(&manifest)? {
-            MainMenuAction::ManageComponents => {
-                let active_shell = state.active_shell.clone();
-                let components = manifest.components_for_shell(active_shell.as_deref());
+    // Enter alternate screen buffer (like btop/vim) so nothing pollutes scrollback
+    print!("\x1b[?1049h");
+    let _ = term.flush();
 
-                if let Some(selection) =
-                    menu::show_components_menu(&components, &state)?
-                {
-                    apply_changes(config, &manifest, &mut state, &selection)?;
-                    state.save(&config.state_file)?;
-                }
-            }
-            MainMenuAction::ChangeShell => {
-                if let Some(new_shell) =
-                    menu::show_shell_menu(&manifest, state.active_shell.as_deref())?
-                {
-                    if state.active_shell.as_deref() != Some(new_shell.as_str()) {
-                        change_shell(config, &manifest, &mut state, &new_shell)?;
+    let res = (|| -> Result<()> {
+        loop {
+            let manifest = Manifest::load(&config.manifest_path())?;
+            match menu::show_main_menu(&manifest, state.active_environment.as_deref())? {
+                MainMenuAction::ManageComponents => {
+                    let active_env = state.active_environment.clone();
+                    let components = manifest.components_for_environment(active_env.as_deref());
+
+                    if let Some(selection) = menu::show_components_menu(&components, &state)? {
+                        menu::render_header(&term, "Applying Changes")?;
+                        apply_changes(config, &manifest, &mut state, &selection)?;
                         state.save(&config.state_file)?;
-                    } else {
-                        println!("Shell is already set to {}.", style(&new_shell).cyan());
+                        menu::wait_for_enter()?;
                     }
                 }
+                MainMenuAction::ChangeEnvironment => {
+                    if let Some(new_env) =
+                        menu::show_environment_menu(&manifest, state.active_environment.as_deref())?
+                    {
+                        change_environment(config, &manifest, &mut state, new_env.as_deref())?;
+                        state.save(&config.state_file)?;
+                        menu::wait_for_enter()?;
+                    }
+                }
+                MainMenuAction::UpdateRepo => {
+                    menu::render_header(&term, "Update Repository")?;
+                    repo::pull_repo(&config.repo_dir)?;
+                    println!("{}", style("Repository updated.").green());
+                    let updated_manifest = Manifest::load(&config.manifest_path())?;
+                    sync_enabled_components(config, &updated_manifest, &mut state)?;
+                    state.save(&config.state_file)?;
+                    menu::wait_for_enter()?;
+                }
+                MainMenuAction::Status => {
+                    menu::render_header(&term, "System Status")?;
+                    menu::show_status(&manifest, &state);
+                    menu::wait_for_enter()?;
+                }
+                MainMenuAction::Exit => {
+                    break;
+                }
             }
-            MainMenuAction::UpdateRepo => {
-                repo::pull_repo(&config.repo_dir)?;
-                println!("{}", style("Repository updated.").green());
-            }
-            MainMenuAction::Status => {
-                menu::show_status(&manifest, &state);
-            }
-            MainMenuAction::Exit => {
-                println!("{}", style("Goodbye!").dim());
-                break;
+        }
+        Ok(())
+    })();
+
+    // Always restore original terminal screen on exit
+    print!("\x1b[?1049l");
+    let _ = term.flush();
+
+    res
+}
+
+fn sync_enabled_components(
+    config: &AppConfig,
+    manifest: &Manifest,
+    state: &mut State,
+) -> Result<()> {
+    let active_env = state.active_environment.clone();
+    let visible = manifest.components_for_environment(active_env.as_deref());
+
+    let enabled: Vec<String> = visible
+        .iter()
+        .filter(|c| state.is_enabled(&c.name))
+        .map(|c| c.name.clone())
+        .collect();
+
+    if enabled.is_empty() {
+        return Ok(());
+    }
+
+    println!("\n{}", style("Syncing enabled components...").cyan());
+    let selection = ComponentSelection {
+        enabled,
+        disabled: Vec::new(),
+        reinstall: false,
+    };
+    apply_changes(config, manifest, state, &selection)
+}
+
+fn collect_retained_packages(
+    manifest: &Manifest,
+    active_env: Option<&str>,
+    enabled_names: &HashSet<&str>,
+) -> HashSet<String> {
+    let mut retained = HashSet::new();
+    for comp in manifest.components_for_environment(active_env) {
+        if enabled_names.contains(comp.name.as_str()) {
+            for pkg in &comp.packages {
+                retained.insert(pkg.clone());
             }
         }
     }
-
-    Ok(())
+    retained
 }
 
-/// Apply component changes: uninstall disabled, install enabled, deploy dotfiles.
 fn apply_changes(
     config: &AppConfig,
     manifest: &Manifest,
@@ -166,18 +240,42 @@ fn apply_changes(
     selection: &ComponentSelection,
 ) -> Result<()> {
     let needed = !selection.reinstall;
+    let active_env = state.active_environment.clone();
 
-    // Phase 1: Uninstall newly-disabled components
+    let mut final_enabled: HashSet<&str> = manifest
+        .components_for_environment(active_env.as_deref())
+        .into_iter()
+        .filter(|c| state.is_enabled(&c.name))
+        .map(|c| c.name.as_str())
+        .collect();
+
     for name in &selection.disabled {
-        if state.is_enabled(name) {
+        final_enabled.remove(name.as_str());
+    }
+    for name in &selection.enabled {
+        final_enabled.insert(name.as_str());
+    }
+
+    let retained_pkgs =
+        collect_retained_packages(manifest, active_env.as_deref(), &final_enabled);
+
+    for name in &selection.disabled {
+        let was_deployed = state.is_enabled(name) || state.deployed.contains_key(name);
+        if was_deployed {
             if let Some(comp) = manifest.find_component(name) {
                 println!(
                     "\n{} {}",
                     style("[-]").red().bold(),
                     style(&comp.name).red()
                 );
-                if !comp.packages.is_empty() {
-                    packages::uninstall_packages(&comp.packages)?;
+                let pkgs_to_remove: Vec<String> = comp
+                    .packages
+                    .iter()
+                    .filter(|p| !retained_pkgs.contains(*p))
+                    .cloned()
+                    .collect();
+                if !pkgs_to_remove.is_empty() {
+                    packages::uninstall_packages(&pkgs_to_remove)?;
                 }
                 deploy::undeploy_component_files(comp, state)?;
             }
@@ -185,7 +283,6 @@ fn apply_changes(
         state.components.insert(name.clone(), false);
     }
 
-    // Phase 2: Check if we need paru
     let needs_paru = selection.enabled.iter().any(|name| {
         manifest
             .find_component(name)
@@ -196,11 +293,9 @@ fn apply_changes(
         packages::ensure_paru()?;
     }
 
-    // Phase 3: Install/update enabled components
-    let active_shell = state.active_shell.clone();
     for name in &selection.enabled {
         if let Some(comp) = manifest.find_component(name) {
-            let was_enabled = state.is_enabled(name);
+            let was_deployed = state.deployed.contains_key(name) || state.is_enabled(name);
 
             println!(
                 "\n{} {}",
@@ -208,27 +303,23 @@ fn apply_changes(
                 style(&comp.name).cyan()
             );
 
-            // Install packages
             if !comp.packages.is_empty() {
                 packages::install_packages(&comp.packages, &config.repo_dir, needed)?;
             }
 
-            // Post-install hooks (only for newly installed components)
-            if !was_enabled && !comp.post_install.is_empty() {
+            if !was_deployed && !comp.post_install.is_empty() {
                 hooks::run_hooks(&comp.post_install, "post_install")?;
             }
 
-            // Deploy dotfiles
             if !comp.files.is_empty() {
-                deploy::deploy_component_files(
+                deploy::redeploy_component_files(
                     comp,
                     config,
                     state,
-                    active_shell.as_deref(),
+                    active_env.as_deref(),
                 )?;
             }
 
-            // Post-deploy hooks
             if !comp.post_deploy.is_empty() {
                 hooks::run_hooks(&comp.post_deploy, "post_deploy")?;
             }
@@ -243,118 +334,128 @@ fn apply_changes(
     Ok(())
 }
 
-/// Change the active shell: undeploy old shell components, deploy new ones,
-/// and re-deploy global components to pick up overlay changes.
-fn change_shell(
+fn change_environment(
     config: &AppConfig,
     manifest: &Manifest,
     state: &mut State,
-    new_shell: &str,
+    new_env: Option<&str>,
 ) -> Result<()> {
-    let old_shell = state.active_shell.clone();
+    let old_env = state.active_environment.clone();
+
+    let env_selection = if let Some(env_name) = new_env {
+        let new_env_components = manifest.components_only_for_environment(env_name);
+        if !new_env_components.is_empty() {
+            println!(
+                "\nConfigure components for environment {}:",
+                style(env_name).cyan().bold()
+            );
+            match menu::show_components_menu(&new_env_components, state)? {
+                Some(sel) => Some(sel),
+                None => {
+                    println!("{}", style("Environment change cancelled.").dim());
+                    return Ok(());
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let term = console::Term::stdout();
+    menu::render_header(&term, "Changing Environment")?;
+
+    let new_label = new_env.unwrap_or("none");
+
+    if old_env.as_deref() == new_env {
+        if let Some(ref sel) = env_selection {
+            apply_changes(config, manifest, state, sel)?;
+        } else {
+            println!("Environment is already set to {}.", style(new_label).cyan());
+        }
+        return Ok(());
+    }
 
     println!(
-        "\nChanging shell{} → {}",
-        old_shell
-            .as_ref()
-            .map(|s| format!(": {}", style(s).red()))
-            .unwrap_or_default(),
-        style(new_shell).green().bold()
+        "\nChanging environment: {} → {}",
+        style(old_env.as_deref().unwrap_or("none")).red(),
+        style(new_label).green().bold()
     );
 
-    // 1. Undeploy and uninstall old shell-specific components
-    if let Some(ref old) = old_shell {
+    let mut new_active_names: HashSet<&str> = manifest
+        .components
+        .iter()
+        .filter(|c| c.environment.is_none() && state.is_enabled(&c.name))
+        .map(|c| c.name.as_str())
+        .collect();
+
+    if let Some(ref sel) = env_selection {
+        for name in &sel.enabled {
+            new_active_names.insert(name.as_str());
+        }
+    }
+    let retained_pkgs = collect_retained_packages(manifest, new_env, &new_active_names);
+
+    if let Some(ref old) = old_env {
         let old_components: Vec<_> = manifest
-            .components
-            .iter()
-            .filter(|c| c.shell.as_deref() == Some(old.as_str()) && state.is_enabled(&c.name))
+            .components_only_for_environment(old)
+            .into_iter()
+            .filter(|c| state.is_enabled(&c.name) || state.deployed.contains_key(&c.name))
             .collect();
 
         for comp in old_components {
             println!(
-                "  {} {} (shell: {})",
+                "  {} {} (environment: {})",
                 style("[-]").red(),
                 comp.name,
                 old
             );
-            if !comp.packages.is_empty() {
-                packages::uninstall_packages(&comp.packages)?;
+            let pkgs_to_remove: Vec<String> = comp
+                .packages
+                .iter()
+                .filter(|p| !retained_pkgs.contains(*p))
+                .cloned()
+                .collect();
+            if !pkgs_to_remove.is_empty() {
+                packages::uninstall_packages(&pkgs_to_remove)?;
             }
             deploy::undeploy_component_files(comp, state)?;
-            state.components.insert(comp.name.clone(), false);
         }
     }
 
-    // 2. Set new shell
-    state.active_shell = Some(new_shell.to_string());
+    state.active_environment = new_env.map(|s| s.to_string());
 
-    // 3. Install and deploy new shell-specific components (default or previously enabled)
-    let new_components: Vec<_> = manifest
-        .components
-        .iter()
-        .filter(|c| c.shell.as_deref() == Some(new_shell))
-        .collect();
-
-    // Check if paru is needed
-    let needs_paru = new_components.iter().any(|c| {
-        (c.default || state.components.get(&c.name).copied().unwrap_or(false))
-            && c.packages.iter().any(|p| !p.starts_with("local:"))
-    });
-    if needs_paru {
-        packages::ensure_paru()?;
+    if let Some(ref sel) = env_selection {
+        apply_changes(config, manifest, state, sel)?;
     }
 
-    for comp in &new_components {
-        let should_enable =
-            comp.default || state.components.get(&comp.name).copied().unwrap_or(false);
-        if should_enable {
-            println!(
-                "  {} {} (shell: {})",
-                style("[+]").green(),
-                comp.name,
-                new_shell
-            );
-            if !comp.packages.is_empty() {
-                packages::install_packages(&comp.packages, &config.repo_dir, true)?;
-            }
-            if !comp.post_install.is_empty() {
-                hooks::run_hooks(&comp.post_install, "post_install")?;
-            }
-            if !comp.files.is_empty() {
-                deploy::deploy_component_files(comp, config, state, Some(new_shell))?;
-            }
-            if !comp.post_deploy.is_empty() {
-                hooks::run_hooks(&comp.post_deploy, "post_deploy")?;
-            }
-            state.components.insert(comp.name.clone(), true);
-        }
-    }
-
-    // 4. Re-deploy global components to pick up overlay changes
     let global_with_files: Vec<_> = manifest
         .components
         .iter()
-        .filter(|c| c.shell.is_none() && state.is_enabled(&c.name) && !c.files.is_empty())
+        .filter(|c| c.environment.is_none() && state.is_enabled(&c.name) && !c.files.is_empty())
         .collect();
 
     if !global_with_files.is_empty() {
         println!("\n  Re-deploying global components for new overlay...");
         for comp in global_with_files {
             println!("  {} {} (overlay update)", style("[~]").yellow(), comp.name);
-            deploy::redeploy_component_files(comp, config, state, Some(new_shell))?;
+            deploy::redeploy_component_files(comp, config, state, new_env)?;
+            if !comp.post_deploy.is_empty() {
+                hooks::run_hooks(&comp.post_deploy, "post_deploy")?;
+            }
         }
     }
 
     println!(
         "\n{}",
-        style(format!("✓ Shell changed to {}", new_shell))
+        style(format!("✓ Environment changed to {}", new_label))
             .green()
             .bold()
     );
     Ok(())
 }
 
-/// Ensure the repository is initialized.
 fn ensure_initialized(config: &AppConfig) -> Result<()> {
     if !config.repo_dir.exists() {
         bail!(

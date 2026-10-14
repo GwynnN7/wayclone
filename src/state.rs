@@ -8,8 +8,8 @@ use serde::{Deserialize, Serialize};
 pub struct State {
     #[serde(default)]
     pub repo_url: Option<String>,
-    #[serde(default)]
-    pub active_shell: Option<String>,
+    #[serde(default, alias = "active_shell")]
+    pub active_environment: Option<String>,
     #[serde(default)]
     pub components: HashMap<String, bool>,
     #[serde(default)]
@@ -45,9 +45,5 @@ impl State {
 
     pub fn is_enabled(&self, name: &str) -> bool {
         self.components.get(name).copied().unwrap_or(false)
-    }
-
-    pub fn is_first_run(&self) -> bool {
-        self.components.is_empty()
     }
 }

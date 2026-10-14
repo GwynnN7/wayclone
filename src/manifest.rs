@@ -9,14 +9,14 @@ fn default_true() -> bool {
 
 #[derive(Debug, Deserialize)]
 pub struct Manifest {
-    #[serde(default)]
-    pub shells: Option<ShellConfig>,
+    #[serde(default, alias = "shells")]
+    pub environments: Option<EnvironmentConfig>,
     #[serde(default)]
     pub components: Vec<Component>,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct ShellConfig {
+pub struct EnvironmentConfig {
     pub available: Vec<String>,
 }
 
@@ -27,8 +27,8 @@ pub struct Component {
     pub category: Option<String>,
     #[serde(default)]
     pub default: bool,
-    #[serde(default)]
-    pub shell: Option<String>,
+    #[serde(default, alias = "shell")]
+    pub environment: Option<String>,
     #[serde(default)]
     pub packages: Vec<String>,
     #[serde(default)]
@@ -53,33 +53,40 @@ impl Manifest {
     pub fn load(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read manifest: {}", path.display()))?;
-        let manifest: Manifest = toml::from_str(&content)
-            .with_context(|| "Failed to parse manifest.toml")?;
+        let manifest: Manifest =
+            toml::from_str(&content).with_context(|| "Failed to parse manifest.toml")?;
         Ok(manifest)
     }
 
-    pub fn available_shells(&self) -> Vec<&str> {
-        self.shells
+    pub fn available_environments(&self) -> Vec<&str> {
+        self.environments
             .as_ref()
             .map(|s| s.available.iter().map(|s| s.as_str()).collect())
             .unwrap_or_default()
     }
 
-    /// Returns components visible for the given active shell.
-    /// Global components (shell=None) are always visible.
-    /// Shell-specific components are only visible when their shell matches.
-    pub fn components_for_shell(&self, shell: Option<&str>) -> Vec<&Component> {
+    /// Returns components visible for the given active environment.
+    /// Global components (environment=None) are always visible.
+    /// Environment-specific components are only visible when their environment matches.
+    pub fn components_for_environment(&self, env: Option<&str>) -> Vec<&Component> {
         self.components
             .iter()
-            .filter(|c| match (&c.shell, shell) {
+            .filter(|c| match (&c.environment, env) {
                 (None, _) => true,
-                (Some(cs), Some(s)) => cs == s,
+                (Some(ce), Some(e)) => ce == e,
                 (Some(_), None) => false,
             })
             .collect()
     }
 
-    /// Returns a component by name, if it exists.
+    /// Returns ONLY the components bound to a specific environment.
+    pub fn components_only_for_environment(&self, env: &str) -> Vec<&Component> {
+        self.components
+            .iter()
+            .filter(|c| c.environment.as_deref() == Some(env))
+            .collect()
+    }
+
     pub fn find_component(&self, name: &str) -> Option<&Component> {
         self.components.iter().find(|c| c.name == name)
     }

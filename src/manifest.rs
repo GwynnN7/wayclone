@@ -47,6 +47,25 @@ pub struct FileEntry {
     pub sudo: bool,
     #[serde(default = "default_true")]
     pub check: bool,
+    /// Optional: only deploy this file when the given environment is active.
+    #[serde(default, alias = "shell")]
+    pub environment: Option<String>,
+}
+
+impl FileEntry {
+    /// Whether this entry should be deployed for the currently active environment.
+    ///
+    /// Entries without an environment are shared; entries with an environment are
+    /// deployed only when it exactly matches the active environment.
+    pub fn applies_to_environment(&self, active_environment: Option<&str>) -> bool {
+        match (&self.environment, active_environment) {
+            (None, _) => true,
+            (Some(file_environment), Some(active_environment)) => {
+                file_environment == active_environment
+            }
+            (Some(_), None) => false,
+        }
+    }
 }
 
 impl Manifest {
@@ -89,5 +108,37 @@ impl Manifest {
 
     pub fn find_component(&self, name: &str) -> Option<&Component> {
         self.components.iter().find(|c| c.name == name)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FileEntry;
+
+    fn file_entry(environment: Option<&str>) -> FileEntry {
+        FileEntry {
+            src: "source".into(),
+            dest: "destination".into(),
+            sudo: false,
+            check: true,
+            environment: environment.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn unscoped_files_apply_to_every_environment() {
+        let entry = file_entry(None);
+
+        assert!(entry.applies_to_environment(None));
+        assert!(entry.applies_to_environment(Some("caelestia")));
+    }
+
+    #[test]
+    fn scoped_files_apply_only_to_their_environment() {
+        let entry = file_entry(Some("caelestia"));
+
+        assert!(entry.applies_to_environment(Some("caelestia")));
+        assert!(!entry.applies_to_environment(Some("noctalia")));
+        assert!(!entry.applies_to_environment(None));
     }
 }

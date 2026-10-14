@@ -1,6 +1,6 @@
 # Waysync
 
-**Waysync** is a declarative dotfile and package manager for Arch-based Linux distributions. It provides a full-screen interactive TUI to manage system packages (native Arch packages, AUR packages via `paru`, and local `PKGBUILD`s), deploy dotfiles with SHA256 conflict detection, and switch between desktop environments or shells (such as `caelestia`, `noctalia`, GNOME, or KDE) using per-file overlays.
+**Waysync** is a declarative dotfile and package manager for Arch-based Linux distributions. It provides a full-screen interactive TUI to manage system packages (native Arch packages, AUR packages via `paru`, and local `PKGBUILD`s), deploy dotfiles with SHA256 conflict detection, and switch between desktop environments or shells (such as `caelestia`, `noctalia`, GNOME, or KDE) using per-file overrides.
 
 ## Quick Installation
 
@@ -42,14 +42,14 @@ curl -fsSL https://raw.githubusercontent.com/GwynnN7/waysync/main/install.sh | b
 
 ## Dotfiles Repository Structure
 
-waysync expects your dotfiles repository to contain `manifest.toml` at the root alongside `dotfiles/`, and optionally `overlays/` and `packages/`:
+waysync expects your dotfiles repository to contain `manifest.toml` at the root alongside `dotfiles/`, and optionally `overrides/` and `packages/`:
 
 ```text
 my-dotfiles-repo/
 ├── manifest.toml          # Declarative configuration of environments & components
 ├── dotfiles/              # Base/global dotfiles (files and directories)
-├── overlays/              # Optional environment-specific file overrides
-│   └── <shell>/
+├── overrides/             # Optional environment-specific file overrides
+│   └── <environment>/
 └── packages/              # Optional local PKGBUILDs (referenced as "local:<name>")
     ├── shell/
     │   └── PKGBUILD
@@ -57,13 +57,19 @@ my-dotfiles-repo/
         └── PKGBUILD
 ```
 
-### How Overlays Work (`dotfiles/` vs `overlays/<env>/`)
+### How Overrides Work (`dotfiles/` vs `overrides/<env>/`)
 
 When an environment (e.g., `caelestia` or `noctalia`) is active, waysync resolves every `[[components.files]]` entry as follows:
 
-1. **Single File (`src = "starship.toml"`):** waysync checks if `overlays/<env>/starship.toml` exists. If found, it deploys the overlay file; otherwise, it falls back to `dotfiles/starship.toml`.
-2. **Directory (`src = "hypr"`):** waysync scans `dotfiles/hypr/` first and then overlays `overlays/<env>/hypr/` on top. Files are merged by their relative path—meaning `overlays/noctalia/hypr/hyprland.conf` overrides `dotfiles/hypr/hyprland.conf`, while all other files in `dotfiles/hypr/` are still deployed without duplication.
-3. **Switching Environments:** Running `waysync env` uninstalls packages and undeploys files belonging to the old environment, installs the new environment's components, re-deploys global components with the new overlay, and removes any orphaned files from the previous overlay.
+1. **Single File (`src = "starship.toml"`):** waysync checks if `overrides/<env>/starship.toml` exists. If found, it deploys that override; otherwise, it falls back to `dotfiles/starship.toml`.
+2. **Directory (`src = "hypr"`):** waysync scans `dotfiles/hypr/` first and then merges `overrides/<env>/hypr/` over it. Files are selected by relative path—so `overrides/noctalia/hypr/hyprland.conf` replaces `dotfiles/hypr/hyprland.conf`, while base-only and override-only files are both deployed.
+3. **Switching Environments:** Running `waysync env` uninstalls packages and undeploys files belonging to the old environment, installs the new environment's components, re-deploys global components with the new overrides, and removes files that no longer apply.
+
+### Per-file Environment Scope
+
+Use `environment` on an individual `[[components.files]]` entry when a component has both shared files and files that should exist only in one environment. Entries without it deploy in every environment; a tagged entry deploys only while its named environment is active. On an environment change, Waysync re-deploys enabled global components and removes files that no longer apply.
+
+This scope applies only to a file entry. Packages and hooks remain component-level; keep those in an environment-specific component when they must not run or install globally.
 
 > **Note on External Git Repositories (`repo:<user>/<repo>`):**
 > Entries using `src = "repo:<user>/<repo>"` are cloned and updated directly from GitHub into their target `dest` directories. They do not need to be stored inside `dotfiles/`.
@@ -92,10 +98,11 @@ post_deploy = [                        # Shell commands run after every dotfile 
 ]
 
 [[components.files]]
-src = "hypr"                           # Path in dotfiles/ (or overlays/<env>/), OR "repo:user/repo"
+src = "hypr"                           # Path in dotfiles/ (or overrides/<env>/), OR "repo:user/repo"
 dest = "$XDG_CONFIG_HOME/hypr"         # Destination path (supports env vars)
 sudo = false                           # Copy/remove using sudo (default: false)
 check = true                           # Prompt with diff if modified locally (default: true)
+environment = "caelestia"              # Optional: deploy this file only in this environment
 ```
 
 ### Supported Environment Variables in `dest`

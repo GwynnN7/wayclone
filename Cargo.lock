@@ -610,7 +610,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "wayclone"
+name = "waysync"
 version = "0.1.0"
 dependencies = [
  "anyhow",

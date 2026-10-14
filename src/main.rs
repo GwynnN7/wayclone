@@ -21,7 +21,7 @@ use state::State;
 
 #[derive(Parser)]
 #[command(
-    name = "wayclone",
+    name = "waysync",
     about = "Declarative dotfile & package manager for Arch-based systems",
     version
 )]
@@ -89,7 +89,7 @@ fn cmd_init(config: &AppConfig, url: &str) -> Result<()> {
     println!(
         "\n{}\nRun {} to manage components.",
         style("Repository initialized successfully!").green().bold(),
-        style("wayclone").cyan()
+        style("waysync").cyan()
     );
     Ok(())
 }
@@ -437,9 +437,13 @@ fn change_environment(
         .collect();
 
     if !global_with_files.is_empty() {
-        println!("\n  Re-deploying global components for new overlay...");
+        println!("\n  Re-deploying global components for new environment overrides...");
         for comp in global_with_files {
-            println!("  {} {} (overlay update)", style("[~]").yellow(), comp.name);
+            println!(
+                "  {} {} (override update)",
+                style("[~]").yellow(),
+                comp.name
+            );
             deploy::redeploy_component_files(comp, config, state, new_env)?;
             if !comp.post_deploy.is_empty() {
                 hooks::run_hooks(&comp.post_deploy, "post_deploy")?;
@@ -460,7 +464,7 @@ fn ensure_initialized(config: &AppConfig) -> Result<()> {
     if !config.repo_dir.exists() {
         bail!(
             "No repository configured. Run '{}' first.",
-            style("wayclone init <url>").cyan()
+            style("waysync init <url>").cyan()
         );
     }
     Ok(())

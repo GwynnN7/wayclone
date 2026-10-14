@@ -24,7 +24,11 @@ pub fn deploy_component_files(
 ) -> Result<()> {
     let mut deployed_files: Vec<String> = Vec::new();
 
-    for file in &component.files {
+    for file in component
+        .files
+        .iter()
+        .filter(|file| file.applies_to_environment(active_shell))
+    {
         let mut file_deployed = deploy_file_entry(file, config, state, active_shell)?;
         deployed_files.append(&mut file_deployed);
     }
@@ -77,7 +81,7 @@ fn deploy_file_entry(
     }
 }
 
-/// Deploy a directory with overlay merging.
+/// Deploy a directory with environment override merging.
 fn deploy_directory(
     src_key: &str,
     dest: &Path,

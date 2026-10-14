@@ -27,7 +27,7 @@ pub fn render_header(term: &Term, subtitle: &str) -> Result<()> {
     term.flush()?;
     println!(
         "  {} {}",
-        style("wayclone").cyan().bold(),
+        style("waysync").cyan().bold(),
         style(format!("── {}", subtitle)).dim()
     );
     println!(
@@ -529,7 +529,7 @@ fn environment_menu_loop(
 }
 
 pub fn show_status(manifest: &Manifest, state: &State) {
-    println!("\n  {}", style("═══ wayclone status ═══").cyan().bold());
+    println!("\n  {}", style("═══ waysync status ═══").cyan().bold());
 
     if let Some(ref url) = state.repo_url {
         println!("  Repository: {}", style(url).dim());

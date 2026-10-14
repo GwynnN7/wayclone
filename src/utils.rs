@@ -11,7 +11,7 @@ use crate::config::AppConfig;
 
 /// Resolved source for a file entry.
 pub enum FileSource {
-    /// A local path (file or directory) in the dotfiles/overlays tree.
+    /// A local path (file or directory) in the dotfiles/overrides tree.
     Local(PathBuf),
     /// A git repository URL to clone.
     Repo(String),
@@ -90,7 +90,7 @@ pub fn hash_contents(contents: &[u8]) -> String {
 }
 
 /// Resolve a file source string to a FileSource.
-/// Handles "repo:user/repo" -> Repo, otherwise Local with overlay resolution.
+/// Handles "repo:user/repo" -> Repo, otherwise Local with override resolution.
 pub fn resolve_file_source(
     src: &str,
     config: &AppConfig,
@@ -103,19 +103,19 @@ pub fn resolve_file_source(
     }
 }
 
-/// Resolve a local dotfile path with overlay priority.
-/// Checks overlays/{shell}/{src} first, then dotfiles/{src}.
+/// Resolve a local dotfile path with environment override priority.
+/// Checks overrides/{environment}/{src} first, then dotfiles/{src}.
 fn resolve_local_path(src: &str, config: &AppConfig, active_shell: Option<&str>) -> PathBuf {
-    if let Some(shell) = active_shell {
-        let overlay_path = config.overlay_dir(shell).join(src);
-        if overlay_path.exists() {
-            return overlay_path;
+    if let Some(environment) = active_shell {
+        let override_path = config.override_dir(environment).join(src);
+        if override_path.exists() {
+            return override_path;
         }
     }
     config.dotfiles_dir().join(src)
 }
 
-/// For directory sources, collect all files with overlay merging.
+/// For directory sources, collect all files with environment override merging.
 /// Returns (absolute_source_path, relative_path_within_src) pairs.
 pub fn collect_directory_files(
     src: &str,
@@ -123,9 +123,10 @@ pub fn collect_directory_files(
     active_shell: Option<&str>,
 ) -> Result<Vec<(PathBuf, PathBuf)>> {
     let base_dir = config.dotfiles_dir().join(src);
-    let overlay_dir = active_shell.map(|s| config.overlay_dir(s).join(src));
+    let override_dir =
+        active_shell.map(|environment| config.override_dir(environment).join(src));
 
-    // Use HashMap to merge: overlay files override base files by relative path
+    // Use HashMap to merge: override files replace base files by relative path.
     let mut files: HashMap<PathBuf, PathBuf> = HashMap::new();
 
     // Collect base files
@@ -142,15 +143,15 @@ pub fn collect_directory_files(
         }
     }
 
-    // Override with overlay files
-    if let Some(ref overlay) = overlay_dir {
-        if overlay.exists() && overlay.is_dir() {
-            for entry in WalkDir::new(overlay)
+    // Replace base files with environment override files.
+    if let Some(ref override_path) = override_dir {
+        if override_path.exists() && override_path.is_dir() {
+            for entry in WalkDir::new(override_path)
                 .into_iter()
                 .filter_map(|e| e.ok())
             {
                 if entry.file_type().is_file() {
-                    if let Ok(relative) = entry.path().strip_prefix(overlay) {
+                    if let Ok(relative) = entry.path().strip_prefix(override_path) {
                         files.insert(relative.to_path_buf(), entry.path().to_path_buf());
                     }
                 }
@@ -226,4 +227,108 @@ fn run_cmd(program: &str, args: &[&str]) -> Result<()> {
         bail!("{} {} failed with exit code {:?}", program, args.join(" "), status.code());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
+
+    fn test_config() -> AppConfig {
+        let unique = format!(
+            "waysync-utils-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is before Unix epoch")
+                .as_nanos()
+        );
+        let root = std::env::temp_dir().join(unique);
+        let state_dir = root.join("state");
+        let data_dir = root.join("data");
+
+        AppConfig {
+            state_file: state_dir.join("state.toml"),
+            repo_dir: data_dir.join("repo"),
+            state_dir,
+            data_dir,
+        }
+    }
+
+    fn local_path(source: FileSource) -> PathBuf {
+        match source {
+            FileSource::Local(path) => path,
+            FileSource::Repo(_) => panic!("expected a local file source"),
+        }
+    }
+
+    #[test]
+    fn environment_override_replaces_a_single_base_file() {
+        let config = test_config();
+        let base = config.dotfiles_dir().join("theme.toml");
+        let environment_override = config.override_dir("caelestia").join("theme.toml");
+        std::fs::create_dir_all(base.parent().expect("base parent")).unwrap();
+        std::fs::create_dir_all(environment_override.parent().expect("override parent")).unwrap();
+        std::fs::write(&base, "base").unwrap();
+        std::fs::write(&environment_override, "caelestia").unwrap();
+
+        assert_eq!(
+            local_path(resolve_file_source("theme.toml", &config, None)),
+            base
+        );
+        assert_eq!(
+            local_path(resolve_file_source("theme.toml", &config, Some("caelestia"))),
+            environment_override
+        );
+        assert_eq!(
+            local_path(resolve_file_source("theme.toml", &config, Some("noctalia"))),
+            config.dotfiles_dir().join("theme.toml")
+        );
+
+        std::fs::remove_dir_all(config.data_dir.parent().expect("test root")).unwrap();
+    }
+
+    #[test]
+    fn environment_override_merges_directories_by_relative_path() {
+        let config = test_config();
+        let base = config.dotfiles_dir().join("hypr");
+        let environment_override = config.override_dir("caelestia").join("hypr");
+        std::fs::create_dir_all(base.join("nested")).unwrap();
+        std::fs::create_dir_all(environment_override.join("nested")).unwrap();
+        std::fs::write(base.join("base-only.conf"), "base-only").unwrap();
+        std::fs::write(base.join("replace.conf"), "base").unwrap();
+        std::fs::write(base.join("nested/base-only.conf"), "nested-base").unwrap();
+        std::fs::write(environment_override.join("replace.conf"), "caelestia").unwrap();
+        std::fs::write(
+            environment_override.join("nested/override-only.conf"),
+            "nested-override",
+        )
+        .unwrap();
+
+        let files: BTreeMap<_, _> = collect_directory_files("hypr", &config, Some("caelestia"))
+            .unwrap()
+            .into_iter()
+            .map(|(source, relative)| (relative, std::fs::read_to_string(source).unwrap()))
+            .collect();
+
+        assert_eq!(
+            files,
+            BTreeMap::from([
+                (PathBuf::from("base-only.conf"), "base-only".to_string()),
+                (PathBuf::from("replace.conf"), "caelestia".to_string()),
+                (
+                    PathBuf::from("nested/base-only.conf"),
+                    "nested-base".to_string()
+                ),
+                (
+                    PathBuf::from("nested/override-only.conf"),
+                    "nested-override".to_string()
+                ),
+            ])
+        );
+
+        std::fs::remove_dir_all(config.data_dir.parent().expect("test root")).unwrap();
+    }
 }

@@ -34,7 +34,7 @@ pub fn ensure_paru() -> Result<()> {
     }
 
     println!("paru not found, installing paru-bin...");
-    let tmp = "/tmp/wayclone-paru-build";
+    let tmp = "/tmp/waysync-paru-build";
     let _ = std::fs::remove_dir_all(tmp);
     let status = Command::new("git")
         .args(["clone", "https://aur.archlinux.org/paru-bin.git", tmp])

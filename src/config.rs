@@ -13,10 +13,10 @@ impl AppConfig {
         let home = dirs::home_dir().expect("Cannot determine home directory");
         let state_dir = dirs::state_dir()
             .unwrap_or_else(|| home.join(".local/state"))
-            .join("wayclone");
+            .join("waysync");
         let data_dir = dirs::data_dir()
             .unwrap_or_else(|| home.join(".local/share"))
-            .join("wayclone");
+            .join("waysync");
         let repo_dir = data_dir.join("repo");
         let state_file = state_dir.join("state.toml");
         Self {
@@ -37,8 +37,8 @@ impl AppConfig {
         self.repo_dir.join("dotfiles")
     }
 
-    pub fn overlay_dir(&self, shell: &str) -> PathBuf {
-        self.repo_dir.join(format!("overlays/{}", shell))
+    pub fn override_dir(&self, environment: &str) -> PathBuf {
+        self.repo_dir.join(format!("overrides/{}", environment))
     }
 
     pub fn manifest_path(&self) -> PathBuf {

@@ -155,9 +155,10 @@ fn cmd_interactive(config: &AppConfig) -> Result<()> {
                     let components = manifest.components_for_environment(active_env.as_deref());
 
                     if let Some(selection) = menu::show_components_menu(&components, &state)? {
-                        menu::render_header(&term, "Applying Changes")?;
-                        apply_changes(config, &manifest, &mut state, &selection)?;
-                        state.save(&config.state_file)?;
+                        run_with_visible_output(&term, "Applying Changes", || {
+                            apply_changes(config, &manifest, &mut state, &selection)?;
+                            state.save(&config.state_file)
+                        })?;
                         menu::wait_for_enter()?;
                     }
                 }
@@ -165,18 +166,21 @@ fn cmd_interactive(config: &AppConfig) -> Result<()> {
                     if let Some(new_env) =
                         menu::show_environment_menu(&manifest, state.active_environment.as_deref())?
                     {
-                        change_environment(config, &manifest, &mut state, new_env.as_deref())?;
-                        state.save(&config.state_file)?;
+                        run_with_visible_output(&term, "Changing Environment", || {
+                            change_environment(config, &manifest, &mut state, new_env.as_deref())?;
+                            state.save(&config.state_file)
+                        })?;
                         menu::wait_for_enter()?;
                     }
                 }
                 MainMenuAction::UpdateRepo => {
-                    menu::render_header(&term, "Update Repository")?;
-                    repo::pull_repo(&config.repo_dir)?;
-                    println!("{}", style("Repository updated.").green());
-                    let updated_manifest = Manifest::load(&config.manifest_path())?;
-                    sync_enabled_components(config, &updated_manifest, &mut state)?;
-                    state.save(&config.state_file)?;
+                    run_with_visible_output(&term, "Update Repository", || {
+                        repo::pull_repo(&config.repo_dir)?;
+                        println!("{}", style("Repository updated.").green());
+                        let updated_manifest = Manifest::load(&config.manifest_path())?;
+                        sync_enabled_components(config, &updated_manifest, &mut state)?;
+                        state.save(&config.state_file)
+                    })?;
                     menu::wait_for_enter()?;
                 }
                 MainMenuAction::Status => {
@@ -197,6 +201,25 @@ fn cmd_interactive(config: &AppConfig) -> Result<()> {
     let _ = term.flush();
 
     res
+}
+
+/// Temporarily leave the alternate screen so package output stays in terminal scrollback.
+/// This also keeps child commands on the same terminal as the initial sudo validation.
+fn run_with_visible_output<T>(
+    term: &console::Term,
+    subtitle: &str,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    print!("\x1b[?1049l");
+    term.flush()?;
+    println!("\n  {} {}", style("waysync").cyan().bold(), style(format!("── {}", subtitle)).dim());
+    println!("  {}\n", style("────────────────────────────────────────────────────────").dim());
+
+    let result = operation();
+
+    print!("\x1b[?1049h");
+    let _ = term.flush();
+    result
 }
 
 fn sync_enabled_components(

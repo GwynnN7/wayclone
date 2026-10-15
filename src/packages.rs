@@ -38,7 +38,7 @@ fn resolve_local_pkgnames(repo_path: &Path, dir_name: &str) -> Vec<String> {
                 let names: Vec<String> = cleaned
                     .split_whitespace()
                     .map(|s| s.trim_matches(|c| c == '"' || c == '\'').to_string())
-                    .filter(|s| !s.is_empty() && !s.contains("\$"))
+                    .filter(|s| !s.is_empty() && !s.contains('$'))
                     .collect();
                 if !names.is_empty() {
                     return names;

@@ -275,7 +275,7 @@ fn apply_changes(
                     .cloned()
                     .collect();
                 if !pkgs_to_remove.is_empty() {
-                    packages::uninstall_packages(&pkgs_to_remove)?;
+                    packages::uninstall_packages(&pkgs_to_remove, &config.repo_dir)?;
                 }
                 deploy::undeploy_component_files(comp, state)?;
             }
@@ -428,7 +428,7 @@ fn change_environment(
                 .cloned()
                 .collect();
             if !pkgs_to_remove.is_empty() {
-                packages::uninstall_packages(&pkgs_to_remove)?;
+                packages::uninstall_packages(&pkgs_to_remove, &config.repo_dir)?;
             }
             deploy::undeploy_component_files(comp, state)?;
         }
@@ -447,7 +447,9 @@ fn change_environment(
             c.environment.is_none()
                 && state.is_enabled(&c.name)
                 && (!c.files.is_empty()
-                    || c.post_install.iter().any(|h| h.environment() == new_env && new_env.is_some())
+                    || c.post_install
+                        .iter()
+                        .any(|h| h.environment() == new_env && new_env.is_some())
                     || !c.post_deploy.is_empty())
         })
         .collect();

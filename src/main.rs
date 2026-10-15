@@ -288,39 +288,106 @@ fn collect_retained_packages(
     retained
 }
 
-/// Keeps a validated sudo credential alive for the duration of one apply operation.
-/// It does not invalidate the user's normal sudo timestamp when the operation ends.
+use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static SUDO_SESSION_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Keeps a validated sudo credential alive for the duration of one apply operation
+/// and shields child hooks (like `hyprpm`) from wiping the timestamp via `sudo -k`.
 struct SudoSession {
-    stop: Sender<()>,
+    stop: Option<Sender<()>>,
     keepalive: Option<thread::JoinHandle<()>>,
+    shim_dir: Option<PathBuf>,
+    old_path: Option<String>,
+    owns_session: bool,
 }
 
 impl Drop for SudoSession {
     fn drop(&mut self) {
-        let _ = self.stop.send(());
+        if !self.owns_session {
+            return;
+        }
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
         if let Some(keepalive) = self.keepalive.take() {
             let _ = keepalive.join();
         }
+        if let Some(ref old_path) = self.old_path {
+            std::env::set_var("PATH", old_path);
+        }
+        if let Some(ref shim_dir) = self.shim_dir {
+            let _ = std::fs::remove_dir_all(shim_dir);
+        }
+        SUDO_SESSION_ACTIVE.store(false, Ordering::SeqCst);
     }
 }
 
 fn start_sudo_session() -> Result<SudoSession> {
-    println!("\n{}", style("Authentication is required for this operation.").cyan());
-    let status = std::process::Command::new("sudo")
+    // If an outer operation (e.g. change_environment) already started a session, reuse it.
+    if SUDO_SESSION_ACTIVE.swap(true, Ordering::SeqCst) {
+        return Ok(SudoSession {
+            stop: None,
+            keepalive: None,
+            shim_dir: None,
+            old_path: None,
+            owns_session: false,
+        });
+    }
+
+    println!(
+        "\n{}",
+        style("Authentication is required for this operation.").cyan()
+    );
+    let status = std::process::Command::new("/usr/bin/sudo")
         .arg("-v")
         .status()
         .context("Failed to request administrator authentication")?;
     if !status.success() {
+        SUDO_SESSION_ACTIVE.store(false, Ordering::SeqCst);
         bail!("Administrator authentication was not accepted");
     }
+
+    // Create a temporary PATH shim for `sudo` that ignores `-k` / `--reset-timestamp`
+    // so tools like `hyprpm` cannot invalidate our active sudo session mid-run.
+    let shim_dir = std::env::temp_dir().join(format!("waysync-sudo-shim-{}", std::process::id()));
+    std::fs::create_dir_all(&shim_dir)?;
+    let shim_script = shim_dir.join("sudo");
+    std::fs::write(
+        &shim_script,
+        r#"#!/bin/sh
+args=""
+for arg in "\$@"; do
+    case "\$arg" in
+        -k|--reset-timestamp|-K|--remove-timestamp)
+            ;;
+        *)
+            args="\$args $(printf '\%s' "$arg" | sed "s/'/'\\\\''/g; s/.*/'&'/")"
+            ;;
+    esac
+done
+eval "set -- \$args"
+if [ "\$#" -eq 0 ]; then
+    exit 0
+fi
+exec /usr/bin/sudo "\$@"
+"#,
+    )?;
+    std::fs::set_permissions(&shim_script, std::fs::Permissions::from_mode(0o755))?;
+
+    let old_path = std::env::var("PATH").unwrap_or_default();
+    let new_path = format!("{}:{}", shim_dir.display(), old_path);
+    std::env::set_var("PATH", &new_path);
 
     let (stop, receiver) = mpsc::channel();
     let keepalive = thread::spawn(move || {
         loop {
-            match receiver.recv_timeout(Duration::from_secs(60)) {
+            match receiver.recv_timeout(Duration::from_secs(30)) {
                 Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    let _ = std::process::Command::new("sudo")
+                    let _ = std::process::Command::new("/usr/bin/sudo")
                         .args(["-n", "-v"])
                         .status();
                 }
@@ -329,9 +396,18 @@ fn start_sudo_session() -> Result<SudoSession> {
     });
 
     Ok(SudoSession {
-        stop,
+        stop: Some(stop),
         keepalive: Some(keepalive),
+        shim_dir: Some(shim_dir),
+        old_path: Some(old_path),
+        owns_session: true,
     })
+}
+
+/// Detect if a hook command invokes `sudo`, `hyprpm`, or `pkexec` anywhere in the script.
+fn hook_requires_sudo(cmd: &str) -> bool {
+    cmd.split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-')
+        .any(|token| matches!(token, "sudo" | "hyprpm" | "pkexec"))
 }
 
 fn component_deployment_requires_sudo(
@@ -347,7 +423,7 @@ fn component_deployment_requires_sudo(
             .iter()
             .chain(component.post_deploy.iter())
             .filter(|hook| hook.applies_to_environment(active_env))
-            .any(|hook| hook.cmd().trim_start().starts_with("sudo "))
+            .any(|hook| hook_requires_sudo(hook.cmd()))
 }
 
 fn component_requires_sudo(component: &manifest::Component, active_env: Option<&str>) -> bool {

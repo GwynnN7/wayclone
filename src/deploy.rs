@@ -139,13 +139,13 @@ fn deploy_single_file(
                     state.hashes.insert(dest_key, src_hash);
                 }
                 DiffAction::KeepLocal => {
-                    // Keep local version, update hash to track current local state
-                    state.hashes.insert(dest_key, dest_hash);
+                    // Remove baseline hash so future syncs still know this file was modified locally
+                    state.hashes.remove(&dest_key);
                 }
                 DiffAction::KeepLocalCopyNew => {
                     let new_path = PathBuf::from(format!("{}.new", dest.display()));
                     copy_file(src, &new_path, file.sudo)?;
-                    state.hashes.insert(dest_key, dest_hash);
+                    state.hashes.remove(&dest_key);
                 }
             }
             return Ok(());

@@ -330,7 +330,7 @@ fn category_components_loop(
     enabled_set: &mut HashSet<String>,
 ) -> Result<()> {
     let mut cursor = 0;
-    let total_rows = comps.len() + 1; // Components + Back row
+    let total_rows = comps.len();
 
     loop {
         render_header(term, &format!("Category: {}", category))?;
@@ -373,20 +373,6 @@ fn category_components_loop(
             println!("  {} {} {}{}{}", pointer, checkbox, name, env_tag, meta);
         }
 
-        println!();
-        let back_idx = comps.len();
-        let p_back = if cursor == back_idx {
-            style("❯").cyan().bold()
-        } else {
-            style(" ").dim()
-        };
-        let l_back = if cursor == back_idx {
-            style("↩  Back to Categories").white().bold()
-        } else {
-            style("↩  Back to Categories").dim()
-        };
-        println!("  {} {}", p_back, l_back);
-
         println!(
             "\n  {}",
             style("↑/↓: Navigate  •  Space: Toggle  •  a: Toggle All  •  Enter/Esc: Back").dim()
@@ -400,15 +386,11 @@ fn category_components_loop(
                 cursor = (cursor + 1) % total_rows;
             }
             Key::Char(' ') => {
-                if cursor < comps.len() {
-                    let name = &comps[cursor].name;
-                    if enabled_set.contains(name) {
-                        enabled_set.remove(name);
-                    } else {
-                        enabled_set.insert(name.clone());
-                    }
+                let name = &comps[cursor].name;
+                if enabled_set.contains(name) {
+                    enabled_set.remove(name);
                 } else {
-                    break;
+                    enabled_set.insert(name.clone());
                 }
             }
             Key::Char('a') => {

@@ -1,5 +1,5 @@
-use std::path::Path;
-use std::process::Command;
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitStatus};
 
 use anyhow::{bail, Context, Result};
 use console::style;
@@ -69,6 +69,59 @@ fn prompt_package_failure(label: &str) -> Result<bool> {
     }
 }
 
+/// Quote a command argument for the shell `script --command` invokes.
+fn shell_quote(argument: &str) -> String {
+    format!("'{}'", argument.replace('\'', "'\\\"'\\\"'"))
+}
+
+/// Path that retains the latest transcript for a particular package operation.
+fn package_log_path(label: &str) -> PathBuf {
+    let safe_label: String = label
+        .chars()
+        .map(|ch| match ch {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' => ch,
+            _ => '-',
+        })
+        .collect();
+    std::env::temp_dir().join(format!("waysync-package-{}.log", safe_label))
+}
+
+/// Run a package command through a pseudo-terminal while saving its complete output.
+/// `script` keeps package managers interactive, unlike piping their output directly.
+fn run_logged_package_command(
+    program: &str,
+    args: &[String],
+    current_dir: Option<&Path>,
+    log_path: &Path,
+    append: bool,
+) -> Result<ExitStatus> {
+    let command_line = std::iter::once(shell_quote(program))
+        .chain(args.iter().map(|arg| shell_quote(arg)))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let mut command = Command::new("script");
+    command
+        .args(["--quiet", "--return", "--flush"])
+        .arg("--command")
+        .arg(command_line);
+    if append {
+        command.arg("--append");
+    }
+    command.arg(log_path);
+    if let Some(dir) = current_dir {
+        command.current_dir(dir);
+    }
+
+    command.status().with_context(|| {
+        format!(
+            "Failed to record output while running {} (log: {})",
+            program,
+            log_path.display()
+        )
+    })
+}
+
 /// Unified runner for all package operations (Standard, AUR, and Local):
 /// 1. Attempts automatic execution with `--noconfirm` (`auto_args`).
 /// 2. If that fails (e.g. conflict or provider prompt), automatically drops into
@@ -81,14 +134,8 @@ fn run_with_interactive_fallback(
     interactive_args: &[String],
     current_dir: Option<&Path>,
 ) -> Result<()> {
-    let mut cmd = Command::new(program);
-    cmd.args(auto_args);
-    if let Some(dir) = current_dir {
-        cmd.current_dir(dir);
-    }
-
-    let status = cmd
-        .status()
+    let log_path = package_log_path(label);
+    let status = run_logged_package_command(program, auto_args, current_dir, &log_path, false)
         .with_context(|| format!("Failed to run {} for {}", program, label))?;
 
     if status.success() {
@@ -96,25 +143,27 @@ fn run_with_interactive_fallback(
     }
 
     println!(
-        "  {} Automatic install failed for '{}'. Retrying interactively...",
+        "  {} Automatic install failed for '{}'. Full output: {}\n    Retrying interactively...",
         style("!").yellow().bold(),
-        style(label).yellow()
+        style(label).yellow(),
+        style(log_path.display()).dim()
     );
 
     loop {
-        let mut retry_cmd = Command::new(program);
-        retry_cmd.args(interactive_args);
-        if let Some(dir) = current_dir {
-            retry_cmd.current_dir(dir);
-        }
-
-        let retry = retry_cmd
-            .status()
+        let retry = run_logged_package_command(
+            program,
+            interactive_args,
+            current_dir,
+            &log_path,
+            true,
+        )
             .with_context(|| format!("Failed to run interactive {} for {}", program, label))?;
 
         if retry.success() {
             return Ok(());
         }
+
+        println!("  Full package output remains available at {}", style(log_path.display()).dim());
 
         if !prompt_package_failure(label)? {
             println!("  {} Skipping {}...", style("→").dim(), label);

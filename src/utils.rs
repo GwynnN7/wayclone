@@ -2,12 +2,15 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
 use crate::config::AppConfig;
+
+static COPY_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Resolved source for a file entry.
 pub enum FileSource {
@@ -164,22 +167,50 @@ pub fn collect_directory_files(
     Ok(result)
 }
 
-/// Copy a file or directory, optionally with sudo.
+/// Build a same-directory temporary path so replacement can use an atomic rename.
+fn temporary_copy_path(dest: &Path) -> PathBuf {
+    let name = dest
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("waysync-file");
+    let sequence = COPY_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    dest.with_file_name(format!(
+        ".{}.waysync-{}-{}.tmp",
+        name,
+        std::process::id(),
+        sequence
+    ))
+}
+
+/// Copy a file atomically, optionally with sudo.
 pub fn copy_file(src: &Path, dest: &Path, sudo: bool) -> Result<()> {
+    let temp = temporary_copy_path(dest);
+
     if sudo {
         if let Some(parent) = dest.parent() {
             run_cmd("sudo", &["mkdir", "-p", &parent.to_string_lossy()])?;
         }
-        // Preserve mode (+x) while ensuring root:root ownership
-        run_cmd(
-            "sudo",
-            &[
-                "cp",
-                "--preserve=mode",
-                &src.to_string_lossy(),
-                &dest.to_string_lossy(),
-            ],
-        )?;
+        // Copy beside the destination, then rename it into place. Renaming replaces
+        // an executable even while its previous inode is still running.
+        let copy_result = (|| -> Result<()> {
+            run_cmd(
+                "sudo",
+                &[
+                    "cp",
+                    "--preserve=mode",
+                    &src.to_string_lossy(),
+                    &temp.to_string_lossy(),
+                ],
+            )?;
+            run_cmd(
+                "sudo",
+                &["mv", "-f", &temp.to_string_lossy(), &dest.to_string_lossy()],
+            )
+        })();
+        if let Err(error) = copy_result {
+            let _ = Command::new("sudo").args(["rm", "-f"]).arg(&temp).status();
+            return Err(error);
+        }
         // sudoers drop-in files must be 0440 and owned by root:root
         if dest.starts_with("/etc/sudoers.d") {
             run_cmd("sudo", &["chmod", "0440", &dest.to_string_lossy()])?;
@@ -189,8 +220,17 @@ pub fn copy_file(src: &Path, dest: &Path, sudo: bool) -> Result<()> {
             fs::create_dir_all(parent)
                 .with_context(|| format!("Failed to create directory: {}", parent.display()))?;
         }
-        fs::copy(src, dest)
-            .with_context(|| format!("Failed to copy {} -> {}", src.display(), dest.display()))?;
+        let copy_result = (|| -> Result<()> {
+            fs::copy(src, &temp)
+                .with_context(|| format!("Failed to copy {} -> {}", src.display(), temp.display()))?;
+            fs::rename(&temp, dest).with_context(|| {
+                format!("Failed to replace {} with {}", dest.display(), temp.display())
+            })
+        })();
+        if let Err(error) = copy_result {
+            let _ = fs::remove_file(&temp);
+            return Err(error);
+        }
     }
     Ok(())
 }
@@ -343,5 +383,32 @@ mod tests {
         );
 
         std::fs::remove_dir_all(config.data_dir.parent().expect("test root")).unwrap();
+    }
+
+    #[test]
+    fn copy_file_replaces_an_existing_file() {
+        let root = std::env::temp_dir().join(format!(
+            "waysync-copy-file-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is before Unix epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("source");
+        let destination = root.join("destination");
+        std::fs::write(&source, "new content").unwrap();
+        std::fs::write(&destination, "old content").unwrap();
+
+        copy_file(&source, &destination, false).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&destination).unwrap(), "new content");
+        assert!(
+            std::fs::read_dir(&root)
+                .unwrap()
+                .all(|entry| !entry.unwrap().file_name().to_string_lossy().contains(".waysync-"))
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

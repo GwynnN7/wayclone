@@ -27,6 +27,8 @@ pub struct Component {
     pub category: Option<String>,
     #[serde(default)]
     pub default: bool,
+    #[serde(default)]
+    pub ask: bool,
     #[serde(default, alias = "shell")]
     pub environment: Option<String>,
     #[serde(default)]
@@ -148,7 +150,7 @@ impl Manifest {
 
 #[cfg(test)]
 mod tests {
-    use super::FileEntry;
+    use super::{FileEntry, Manifest};
 
     fn file_entry(environment: Option<&str>) -> FileEntry {
         FileEntry {
@@ -175,5 +177,23 @@ mod tests {
         assert!(entry.applies_to_environment(Some("caelestia")));
         assert!(!entry.applies_to_environment(Some("noctalia")));
         assert!(!entry.applies_to_environment(None));
+    }
+
+    #[test]
+    fn component_ask_defaults_to_false() {
+        let manifest: Manifest = toml::from_str(
+            r#"
+            [[components]]
+            name = "normal"
+
+            [[components]]
+            name = "optional"
+            ask = true
+            "#,
+        )
+        .unwrap();
+
+        assert!(!manifest.components[0].ask);
+        assert!(manifest.components[1].ask);
     }
 }

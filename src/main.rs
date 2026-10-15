@@ -156,9 +156,19 @@ fn cmd_interactive(config: &AppConfig) -> Result<()> {
 
                     if let Some(selection) = menu::show_components_menu(&components, &state)? {
                         run_with_visible_output(&term, "Applying Changes", || {
-                            apply_changes(config, &manifest, &mut state, &selection)?;
+                            apply_changes(
+                                config,
+                                &manifest,
+                                &mut state,
+                                &selection,
+                            )?;
                             state.save(&config.state_file)
                         })?;
+                        menu::show_completion(
+                            &term,
+                            "Changes Applied",
+                            "Component changes completed successfully.",
+                        )?;
                         menu::wait_for_enter()?;
                     }
                 }
@@ -170,6 +180,11 @@ fn cmd_interactive(config: &AppConfig) -> Result<()> {
                             change_environment(config, &manifest, &mut state, new_env.as_deref())?;
                             state.save(&config.state_file)
                         })?;
+                        menu::show_completion(
+                            &term,
+                            "Environment Changed",
+                            "Environment configuration completed.",
+                        )?;
                         menu::wait_for_enter()?;
                     }
                 }
@@ -181,12 +196,15 @@ fn cmd_interactive(config: &AppConfig) -> Result<()> {
                         sync_enabled_components(config, &updated_manifest, &mut state)?;
                         state.save(&config.state_file)
                     })?;
+                    menu::show_completion(
+                        &term,
+                        "Repository Updated",
+                        "Repository refresh and enabled-component sync completed.",
+                    )?;
                     menu::wait_for_enter()?;
                 }
                 MainMenuAction::Status => {
-                    menu::render_header(&term, "System Status")?;
-                    menu::show_status(&manifest, &state);
-                    menu::wait_for_enter()?;
+                    menu::show_status_menu(&manifest, &state)?;
                 }
                 MainMenuAction::Exit => {
                     break;
@@ -246,7 +264,12 @@ fn sync_enabled_components(
         disabled: Vec::new(),
         reinstall: false,
     };
-    apply_changes(config, manifest, state, &selection)
+    apply_changes(
+        config,
+        manifest,
+        state,
+        &selection,
+    )
 }
 
 fn collect_retained_packages(
@@ -376,9 +399,49 @@ fn apply_changes(
     state: &mut State,
     selection: &ComponentSelection,
 ) -> Result<()> {
+    let enabled = selection
+        .enabled
+        .iter()
+        .filter_map(|name| {
+            let component = manifest.find_component(name)?;
+            let already_installed =
+                state.is_enabled(&component.name) || state.deployed.contains_key(&component.name);
+            let needs_confirmation = component.ask && already_installed && !selection.reinstall;
+
+            if !needs_confirmation {
+                return Some(component.name.clone());
+            }
+
+            match menu::confirm_component_update(&component.name) {
+                Ok(true) => Some(component.name.clone()),
+                Ok(false) => {
+                    println!(
+                        "  {} Skipping optional update for {}.",
+                        style("→").dim(),
+                        style(&component.name).yellow()
+                    );
+                    None
+                }
+                Err(error) => {
+                    eprintln!(
+                        "  {} Could not ask about {}: {}",
+                        style("!").yellow(),
+                        component.name,
+                        error
+                    );
+                    None
+                }
+            }
+        })
+        .collect();
+    let selection = ComponentSelection {
+        enabled,
+        disabled: selection.disabled.clone(),
+        reinstall: selection.reinstall,
+    };
     let needed = !selection.reinstall;
     let active_env = state.active_environment.clone();
-    let _sudo_session = selection_requires_sudo(manifest, selection, active_env.as_deref())
+    let _sudo_session = selection_requires_sudo(manifest, &selection, active_env.as_deref())
         .then(start_sudo_session)
         .transpose()?;
 
@@ -421,6 +484,7 @@ fn apply_changes(
             }
         }
         state.components.insert(name.clone(), false);
+        state.save(&config.state_file)?;
     }
 
     let needs_paru = selection.enabled.iter().any(|name| {
@@ -475,6 +539,7 @@ fn apply_changes(
             }
         }
         state.components.insert(name.clone(), true);
+        state.save(&config.state_file)?;
     }
 
     println!(

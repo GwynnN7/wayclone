@@ -87,6 +87,7 @@ available = ["caelestia", "noctalia"]
 name = "hypr"                          # Unique component identifier
 category = "wm"                        # Menu category (defaults to "general")
 default = true                         # Checked by default on first run (default: false)
+ask = true                             # Ask before re-deploying an installed component (default: false)
 environment = "caelestia"              # Optional: bind component to a specific environment
 packages = [
     "hyprland",                        # Native Arch or AUR package (installed via paru)

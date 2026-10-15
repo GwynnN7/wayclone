@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
 use console::{style, Key, Term};
+use dialoguer::Confirm;
 
 use crate::manifest::{Component, Manifest};
 use crate::state::State;
@@ -51,6 +52,22 @@ pub fn wait_for_enter() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Render a short result screen before returning to the main menu.
+pub fn show_completion(term: &Term, title: &str, message: &str) -> Result<()> {
+    render_header(term, title)?;
+    println!("  {} {}", style("✓").green().bold(), style(message).green().bold());
+    Ok(())
+}
+
+/// Ask whether an already installed optional component should be deployed now.
+pub fn confirm_component_update(component: &str) -> Result<bool> {
+    Confirm::new()
+        .with_prompt(format!("Deploy optional component '{}' now?", component))
+        .default(false)
+        .interact()
+        .map_err(Into::into)
 }
 
 /// Interactive Main Menu.
@@ -510,24 +527,26 @@ fn environment_menu_loop(
     }
 }
 
-pub fn show_status(manifest: &Manifest, state: &State) {
-    println!("\n  {}", style("═══ waysync status ═══").cyan().bold());
-
+fn status_lines(manifest: &Manifest, state: &State) -> Vec<String> {
+    let mut lines = Vec::new();
     if let Some(ref url) = state.repo_url {
-        println!("  Repository: {}", style(url).dim());
+        lines.push(format!("  Repository: {}", style(url).dim()));
     }
     let env_label = state
         .active_environment
         .as_deref()
         .unwrap_or("none");
-    println!("  Active environment: {}", style(env_label).cyan().bold());
+    lines.push(format!(
+        "  Active environment: {}",
+        style(env_label).cyan().bold()
+    ));
 
     let active_env = state.active_environment.as_deref();
     let components = manifest.components_for_environment(active_env);
 
     if components.is_empty() {
-        println!("  No components configured.");
-        return;
+        lines.push("  No components configured.".to_string());
+        return lines;
     }
 
     let mut category_order: Vec<String> = Vec::new();
@@ -541,9 +560,9 @@ pub fn show_status(manifest: &Manifest, state: &State) {
         by_category.entry(cat).or_default().push(comp);
     }
 
-    println!();
+    lines.push(String::new());
     for cat in &category_order {
-        println!("  {}", style(format!("┌─ {} ─┐", cat)).dim());
+        lines.push(format!("  {}", style(format!("┌─ {} ─┐", cat)).dim()));
         for comp in &by_category[cat] {
             let enabled = state.is_enabled(&comp.name);
             let status_icon = if enabled {
@@ -564,21 +583,75 @@ pub fn show_status(manifest: &Manifest, state: &State) {
                 .unwrap_or_default();
 
             if enabled && deployed_count > 0 {
-                println!(
+                lines.push(format!(
                     "    {} {}{} {} files deployed",
                     status_icon,
                     comp.name,
                     style(&env_tag).dim(),
                     style(format!("({})", deployed_count)).dim()
-                );
+                ));
             } else {
-                println!(
+                lines.push(format!(
                     "    {} {}{}",
                     status_icon,
                     comp.name,
                     style(&env_tag).dim()
-                );
+                ));
             }
         }
     }
+    lines
+}
+
+/// Print a status report for the non-interactive CLI command.
+pub fn show_status(manifest: &Manifest, state: &State) {
+    for line in status_lines(manifest, state) {
+        println!("{}", line);
+    }
+}
+
+/// Show a scrollable status view in the full-screen menu.
+pub fn show_status_menu(manifest: &Manifest, state: &State) -> Result<()> {
+    let term = Term::stdout();
+    let lines = status_lines(manifest, state);
+    let mut offset = 0usize;
+    let _ = term.hide_cursor();
+
+    let result = (|| -> Result<()> {
+        loop {
+            render_header(&term, "System Status")?;
+            let (rows, _) = term.size();
+            let visible_rows = usize::from(rows).saturating_sub(7).max(1);
+            let max_offset = lines.len().saturating_sub(visible_rows);
+            offset = offset.min(max_offset);
+
+            for line in lines.iter().skip(offset).take(visible_rows) {
+                println!("{}", line);
+            }
+
+            let position = if max_offset == 0 {
+                String::new()
+            } else {
+                format!("  •  {}/{}", offset + 1, max_offset + 1)
+            };
+            println!(
+                "\n  {}{}",
+                style("↑/↓: Scroll  •  Enter/Esc: Back").dim(),
+                style(position).dim()
+            );
+
+            match term.read_key()? {
+                Key::ArrowUp | Key::Char('k') => offset = offset.saturating_sub(1),
+                Key::ArrowDown | Key::Char('j') => offset = (offset + 1).min(max_offset),
+                Key::Enter | Key::Escape | Key::ArrowLeft | Key::Char('h') | Key::Char('q') => {
+                    break
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    })();
+
+    let _ = term.show_cursor();
+    result
 }

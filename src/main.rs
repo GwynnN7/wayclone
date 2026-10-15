@@ -9,8 +9,11 @@ mod state;
 mod utils;
 
 use std::collections::HashSet;
+use std::sync::mpsc::{self, Sender};
+use std::thread;
+use std::time::Duration;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use console::style;
 
@@ -239,6 +242,111 @@ fn collect_retained_packages(
     retained
 }
 
+/// Keeps a validated sudo credential alive for the duration of one apply operation.
+/// It does not invalidate the user's normal sudo timestamp when the operation ends.
+struct SudoSession {
+    stop: Sender<()>,
+    keepalive: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for SudoSession {
+    fn drop(&mut self) {
+        let _ = self.stop.send(());
+        if let Some(keepalive) = self.keepalive.take() {
+            let _ = keepalive.join();
+        }
+    }
+}
+
+fn start_sudo_session() -> Result<SudoSession> {
+    println!("\n{}", style("Authentication is required for this operation.").cyan());
+    let status = std::process::Command::new("sudo")
+        .arg("-v")
+        .status()
+        .context("Failed to request administrator authentication")?;
+    if !status.success() {
+        bail!("Administrator authentication was not accepted");
+    }
+
+    let (stop, receiver) = mpsc::channel();
+    let keepalive = thread::spawn(move || {
+        loop {
+            match receiver.recv_timeout(Duration::from_secs(60)) {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    let _ = std::process::Command::new("sudo")
+                        .args(["-n", "-v"])
+                        .status();
+                }
+            }
+        }
+    });
+
+    Ok(SudoSession {
+        stop,
+        keepalive: Some(keepalive),
+    })
+}
+
+fn component_deployment_requires_sudo(
+    component: &manifest::Component,
+    active_env: Option<&str>,
+) -> bool {
+    component
+        .files
+        .iter()
+        .any(|file| file.sudo && file.applies_to_environment(active_env))
+        || component
+            .post_install
+            .iter()
+            .chain(component.post_deploy.iter())
+            .filter(|hook| hook.applies_to_environment(active_env))
+            .any(|hook| hook.cmd().trim_start().starts_with("sudo "))
+}
+
+fn component_requires_sudo(component: &manifest::Component, active_env: Option<&str>) -> bool {
+    !component.packages.is_empty() || component_deployment_requires_sudo(component, active_env)
+}
+
+fn selection_requires_sudo(
+    manifest: &Manifest,
+    selection: &ComponentSelection,
+    active_env: Option<&str>,
+) -> bool {
+    selection
+        .enabled
+        .iter()
+        .chain(selection.disabled.iter())
+        .filter_map(|name| manifest.find_component(name))
+        .any(|component| component_requires_sudo(component, active_env))
+}
+
+fn enabled_environment_components_require_sudo(
+    manifest: &Manifest,
+    state: &State,
+    environment: &str,
+) -> bool {
+    manifest
+        .components_only_for_environment(environment)
+        .into_iter()
+        .filter(|component| {
+            state.is_enabled(&component.name) || state.deployed.contains_key(&component.name)
+        })
+        .any(|component| component_requires_sudo(component, Some(environment)))
+}
+
+fn enabled_global_components_require_sudo(
+    manifest: &Manifest,
+    state: &State,
+    active_env: Option<&str>,
+) -> bool {
+    manifest
+        .components
+        .iter()
+        .filter(|component| component.environment.is_none() && state.is_enabled(&component.name))
+        .any(|component| component_deployment_requires_sudo(component, active_env))
+}
+
 fn apply_changes(
     config: &AppConfig,
     manifest: &Manifest,
@@ -247,6 +355,9 @@ fn apply_changes(
 ) -> Result<()> {
     let needed = !selection.reinstall;
     let active_env = state.active_environment.clone();
+    let _sudo_session = selection_requires_sudo(manifest, selection, active_env.as_deref())
+        .then(start_sudo_session)
+        .transpose()?;
 
     let mut final_enabled: HashSet<&str> = manifest
         .components_for_environment(active_env.as_deref())
@@ -392,6 +503,24 @@ fn change_environment(
         }
         return Ok(());
     }
+
+    let old_environment_requires_sudo = old_env
+        .as_deref()
+        .map(|environment| {
+            enabled_environment_components_require_sudo(manifest, state, environment)
+        })
+        .unwrap_or(false);
+    let new_selection_requires_sudo = env_selection
+        .as_ref()
+        .map(|selection| selection_requires_sudo(manifest, selection, new_env))
+        .unwrap_or(false);
+    let global_components_require_sudo =
+        enabled_global_components_require_sudo(manifest, state, new_env);
+    let _sudo_session = (old_environment_requires_sudo
+        || new_selection_requires_sudo
+        || global_components_require_sudo)
+        .then(start_sudo_session)
+        .transpose()?;
 
     println!(
         "\nChanging environment: {} → {}",

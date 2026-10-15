@@ -26,10 +26,29 @@ pub fn parse_package_spec(spec: &str) -> PackageSpec {
     }
 }
 
-/// Extract actual `pkgname` value(s) from `packages/{dir_name}/PKGBUILD`.
-/// Falls back to `dir_name` if the PKGBUILD cannot be read or parsed.
+/// Extract actual package names from `packages/{dir_name}`.
+/// PKGBUILDs often derive `pkgname` from shell variables, so prefer makepkg's
+/// evaluated `.SRCINFO` output over trying to parse the PKGBUILD directly.
 fn resolve_local_pkgnames(repo_path: &Path, dir_name: &str) -> Vec<String> {
-    let pkgbuild_path = repo_path.join("packages").join(dir_name).join("PKGBUILD");
+    let package_dir = repo_path.join("packages").join(dir_name);
+    if let Ok(output) = Command::new("makepkg")
+        .arg("--printsrcinfo")
+        .current_dir(&package_dir)
+        .output()
+    {
+        if output.status.success() {
+            let names: Vec<String> = String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .filter_map(|line| line.trim().strip_prefix("pkgname = "))
+                .map(str::to_owned)
+                .collect();
+            if !names.is_empty() {
+                return names;
+            }
+        }
+    }
+
+    let pkgbuild_path = package_dir.join("PKGBUILD");
     if let Ok(content) = std::fs::read_to_string(&pkgbuild_path) {
         for line in content.lines() {
             let trimmed = line.trim();
@@ -71,7 +90,7 @@ fn prompt_package_failure(label: &str) -> Result<bool> {
 
 /// Quote a command argument for the shell `script --command` invokes.
 fn shell_quote(argument: &str) -> String {
-    format!("'{}'", argument.replace('\'', "'\\\"'\\\"'"))
+    format!("'{}'", argument.replace('\'', r#"'"'"'"#))
 }
 
 /// Path that retains the latest transcript for a particular package operation.
@@ -165,7 +184,9 @@ fn run_with_interactive_fallback(
 
         println!("  Full package output remains available at {}", style(log_path.display()).dim());
 
-        if !prompt_package_failure(label)? {
+        let retry_requested = prompt_package_failure(label)
+            .with_context(|| format!("Package failure transcript: {}", log_path.display()))?;
+        if !retry_requested {
             println!("  {} Skipping {}...", style("→").dim(), label);
             return Ok(());
         }
@@ -352,4 +373,14 @@ pub fn uninstall_packages(packages: &[String], repo_path: &Path) -> Result<()> {
     interactive_args.extend(names);
 
     run_with_interactive_fallback(&label, "sudo", &auto_args, &interactive_args, None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::shell_quote;
+
+    #[test]
+    fn shell_quote_preserves_single_quotes() {
+        assert_eq!(shell_quote("it's ready"), "'it'\"'\"'s ready'");
+    }
 }

@@ -350,31 +350,27 @@ fn start_sudo_session() -> Result<SudoSession> {
         bail!("Administrator authentication was not accepted");
     }
 
-    // Create a temporary PATH shim for `sudo` that ignores `-k` / `--reset-timestamp`
+    // Create a temporary PATH shim for `sudo` that strips `-k` / `--reset-timestamp`
     // so tools like `hyprpm` cannot invalidate our active sudo session mid-run.
+    // Uses \x24 instead of literal '\$' to prevent terminal copy-paste escaping.
     let shim_dir = std::env::temp_dir().join(format!("waysync-sudo-shim-{}", std::process::id()));
     std::fs::create_dir_all(&shim_dir)?;
     let shim_script = shim_dir.join("sudo");
-    std::fs::write(
-        &shim_script,
-        r#"#!/bin/sh
-args=""
-for arg in "\$@"; do
-    case "\$arg" in
-        -k|--reset-timestamp|-K|--remove-timestamp)
-            ;;
-        *)
-            args="\$args $(printf '\%s' "$arg" | sed "s/'/'\\\\''/g; s/.*/'&'/")"
-            ;;
-    esac
-done
-eval "set -- \$args"
-if [ "\$#" -eq 0 ]; then
-    exit 0
-fi
-exec /usr/bin/sudo "\$@"
-"#,
-    )?;
+    let script_content = concat!(
+        "#!/bin/sh\n",
+        "for arg in \"\x24@\"; do\n",
+        "    shift\n",
+        "    case \"\x24arg\" in\n",
+        "        -k|--reset-timestamp|-K|--remove-timestamp) ;;\n",
+        "        *) set -- \"\x24@\" \"\x24arg\" ;;\n",
+        "    esac\n",
+        "done\n",
+        "if [ \"\x24#\" -eq 0 ]; then\n",
+        "    exit 0\n",
+        "fi\n",
+        "exec /usr/bin/sudo \"\x24@\"\n"
+    );
+    std::fs::write(&shim_script, script_content)?;
     std::fs::set_permissions(&shim_script, std::fs::Permissions::from_mode(0o755))?;
 
     let old_path = std::env::var("PATH").unwrap_or_default();

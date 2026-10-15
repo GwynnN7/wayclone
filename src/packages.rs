@@ -15,6 +15,12 @@ pub enum PackageSpec {
     Local(String),
 }
 
+/// Metadata extracted from a local package's `.SRCINFO` / `PKGBUILD`.
+struct LocalPkgInfo {
+    names: Vec<String>,
+    version: Option<String>,
+}
+
 /// Parse a package spec string.
 pub fn parse_package_spec(spec: &str) -> PackageSpec {
     if let Some(name) = spec.strip_prefix("local:") {
@@ -26,10 +32,21 @@ pub fn parse_package_spec(spec: &str) -> PackageSpec {
     }
 }
 
-/// Extract actual package names from `packages/{dir_name}`.
-/// PKGBUILDs often derive `pkgname` from shell variables, so prefer makepkg's
-/// evaluated `.SRCINFO` output over trying to parse the PKGBUILD directly.
-fn resolve_local_pkgnames(repo_path: &Path, dir_name: &str) -> Vec<String> {
+/// Check if a PKGBUILD defines a dynamic `pkgver()` function.
+fn pkgbuild_has_pkgver_func(package_dir: &Path) -> bool {
+    let pkgbuild_path = package_dir.join("PKGBUILD");
+    if let Ok(content) = std::fs::read_to_string(pkgbuild_path) {
+        content.lines().any(|line| {
+            let trimmed = line.trim();
+            trimmed.starts_with("pkgver()") || trimmed.starts_with("function pkgver")
+        })
+    } else {
+        false
+    }
+}
+
+/// Extract package names and full target version (`[epoch:]pkgver-pkgrel`) from `packages/{dir_name}`.
+fn resolve_local_pkg_info(repo_path: &Path, dir_name: &str) -> LocalPkgInfo {
     let package_dir = repo_path.join("packages").join(dir_name);
     if let Ok(output) = Command::new("makepkg")
         .arg("--printsrcinfo")
@@ -37,13 +54,35 @@ fn resolve_local_pkgnames(repo_path: &Path, dir_name: &str) -> Vec<String> {
         .output()
     {
         if output.status.success() {
-            let names: Vec<String> = String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .filter_map(|line| line.trim().strip_prefix("pkgname = "))
-                .map(str::to_owned)
-                .collect();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let mut names = Vec::new();
+            let mut pkgver = None;
+            let mut pkgrel = None;
+            let mut epoch = None;
+
+            for line in stdout.lines() {
+                let trimmed = line.trim();
+                if let Some(name) = trimmed.strip_prefix("pkgname = ") {
+                    names.push(name.to_owned());
+                } else if let Some(ver) = trimmed.strip_prefix("pkgver = ") {
+                    pkgver = Some(ver.to_owned());
+                } else if let Some(rel) = trimmed.strip_prefix("pkgrel = ") {
+                    pkgrel = Some(rel.to_owned());
+                } else if let Some(ep) = trimmed.strip_prefix("epoch = ") {
+                    if !ep.is_empty() && ep != "0" {
+                        epoch = Some(ep.to_owned());
+                    }
+                }
+            }
+
+            let version = match (epoch, pkgver, pkgrel) {
+                (Some(ep), Some(ver), Some(rel)) => Some(format!("{}:{}-{}", ep, ver, rel)),
+                (None, Some(ver), Some(rel)) => Some(format!("{}-{}", ver, rel)),
+                _ => None,
+            };
+
             if !names.is_empty() {
-                return names;
+                return LocalPkgInfo { names, version };
             }
         }
     }
@@ -57,15 +96,113 @@ fn resolve_local_pkgnames(repo_path: &Path, dir_name: &str) -> Vec<String> {
                 let names: Vec<String> = cleaned
                     .split_whitespace()
                     .map(|s| s.trim_matches(|c| c == '"' || c == '\'').to_string())
-                    .filter(|s| !s.is_empty() && !s.contains('$'))
+                    .filter(|s| !s.is_empty() && !s.contains('\x24'))
                     .collect();
                 if !names.is_empty() {
-                    return names;
+                    return LocalPkgInfo {
+                        names,
+                        version: None,
+                    };
                 }
             }
         }
     }
-    vec![dir_name.to_string()]
+
+    LocalPkgInfo {
+        names: vec![dir_name.to_string()],
+        version: None,
+    }
+}
+
+/// Get the currently installed version of a package via `pacman -Q <name>`.
+fn get_installed_version(name: &str) -> Option<String> {
+    let output = Command::new("pacman")
+        .args(["-Q", name])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout.split_whitespace().nth(1).map(str::to_owned)
+}
+
+/// Compare two Arch package versions using `vercmp`.
+/// Returns `true` if `installed` is older than `target` (`vercmp` < 0).
+fn is_version_older(installed: &str, target: &str) -> bool {
+    if let Ok(output) = Command::new("vercmp").args([installed, target]).output() {
+        if output.status.success() {
+            let cmp = String::from_utf8_lossy(&output.stdout)
+                .trim()
+                .parse::<i32>()
+                .unwrap_or(0);
+            return cmp < 0;
+        }
+    }
+    installed != target
+}
+
+/// Check whether a local package in `packages/{name}` needs to be built/updated.
+fn local_package_needs_build(repo_path: &Path, name: &str) -> Result<bool> {
+    let pkg_dir = repo_path.join("packages").join(name);
+    if !pkg_dir.exists() {
+        bail!("Local package directory not found: {}", pkg_dir.display());
+    }
+
+    let initial_info = resolve_local_pkg_info(repo_path, name);
+
+    // If any split/target package is not installed yet, we must build it.
+    if initial_info
+        .names
+        .iter()
+        .any(|p| !is_exact_package_installed(p))
+    {
+        return Ok(true);
+    }
+
+    // If the PKGBUILD has a dynamic `pkgver()` function (e.g. git package),
+    // run `makepkg -od --noconfirm` to fetch latest sources and refresh `pkgver`
+    // without compiling.
+    if pkgbuild_has_pkgver_func(&pkg_dir) {
+        println!(
+            "  Checking upstream sources for local package: {}...",
+            style(name).cyan()
+        );
+        let _ = Command::new("makepkg")
+            .args(["-od", "--noconfirm"])
+            .current_dir(&pkg_dir)
+            .status();
+    }
+
+    let updated_info = resolve_local_pkg_info(repo_path, name);
+    let Some(target_ver) = updated_info.version else {
+        return Ok(true);
+    };
+
+    for pkg in &updated_info.names {
+        match get_installed_version(pkg) {
+            Some(installed_ver) => {
+                if is_version_older(&installed_ver, &target_ver) {
+                    println!(
+                        "  Update available for {} ({} → {})",
+                        style(pkg).cyan(),
+                        style(installed_ver).dim(),
+                        style(&target_ver).green()
+                    );
+                    return Ok(true);
+                }
+            }
+            None => return Ok(true),
+        }
+    }
+
+    println!(
+        "  {} is already up to date ({}), skipping",
+        name,
+        style(&target_ver).dim()
+    );
+    Ok(false)
 }
 
 /// Ask user how to proceed if an interactive package installation still fails.
@@ -208,13 +345,8 @@ pub fn install_packages(packages: &[String], repo_path: &Path, needed: bool) -> 
 
     // 1. Explicit AUR packages (`aur:<name>`)
     for pkg in aur {
-        if needed && is_exact_package_installed(&pkg) {
-            println!("  {} (AUR) is already installed, skipping", pkg);
-            continue;
-        }
-
         let label = format!("aur:{}", pkg);
-        println!("  Installing AUR package: {}", pkg);
+        println!("  Installing/checking AUR package: {}", pkg);
 
         let mut base_args = vec!["-S".to_string(), "--aur".to_string()];
         if needed {
@@ -234,7 +366,7 @@ pub fn install_packages(packages: &[String], repo_path: &Path, needed: bool) -> 
     // 2. Standard packages (native or AUR via `paru -S`)
     if !standard.is_empty() {
         let label = standard.join(", ");
-        println!("  Installing packages: {}", label);
+        println!("  Installing/checking packages: {}", label);
 
         let mut base_args = vec!["-S".to_string()];
         if needed {
@@ -253,17 +385,11 @@ pub fn install_packages(packages: &[String], repo_path: &Path, needed: bool) -> 
 
     // 3. Local PKGBUILD packages (`local:<name>`) built via `paru -Ui`
     for name in local {
-        let pkgnames = resolve_local_pkgnames(repo_path, &name);
-        if needed && pkgnames.iter().all(|p| is_exact_package_installed(p)) {
-            println!("  {} is already installed, skipping", name);
+        if needed && !local_package_needs_build(repo_path, &name)? {
             continue;
         }
 
         let pkg_dir = repo_path.join("packages").join(&name);
-        if !pkg_dir.exists() {
-            bail!("Local package directory not found: {}", pkg_dir.display());
-        }
-
         let label = format!("local:{}", name);
         println!("  Building local package: {}", name);
 
@@ -293,7 +419,7 @@ pub fn uninstall_packages(packages: &[String], repo_path: &Path) -> Result<()> {
                 }
             }
             PackageSpec::Local(dir_name) => {
-                for pkg in resolve_local_pkgnames(repo_path, &dir_name) {
+                for pkg in resolve_local_pkg_info(repo_path, &dir_name).names {
                     if is_exact_package_installed(&pkg) {
                         names.push(pkg);
                     }

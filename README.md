@@ -26,6 +26,8 @@ curl -fsSL https://raw.githubusercontent.com/GwynnN7/waysync/main/install.sh | b
 | `waysync update` | Pull the latest changes from your dotfiles repository and sync enabled components. |
 | `waysync status` | Display the current repository, active environment, and deployed component status. |
 
+When launched without a command, Waysync refreshes the dotfiles repository before opening the menu. If the remote cannot be reached, it opens the menu using the local copy instead.
+
 ### Interactive TUI Controls
 
 **Categories View:**

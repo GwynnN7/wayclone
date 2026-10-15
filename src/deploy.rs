@@ -221,6 +221,8 @@ fn cleanup_empty_parents(file_path: &Path, sudo: bool) {
     let protected: HashSet<PathBuf> = [
         "/",
         "/etc",
+        "/etc/sudoers.d",
+        "/etc/sddm.conf.d",
         "/usr",
         "/usr/bin",
         "/usr/lib",
@@ -232,6 +234,8 @@ fn cleanup_empty_parents(file_path: &Path, sudo: bool) {
         &expand_env("$XDG_DATA_HOME"),
         &expand_env("$XDG_STATE_HOME"),
         &expand_env("$XDG_CACHE_HOME"),
+        &expand_env("$XDG_BIN_HOME"),
+        &expand_env("$XDG_CONFIG_SERVICE"),
     ]
     .into_iter()
     .map(PathBuf::from)

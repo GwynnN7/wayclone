@@ -170,7 +170,20 @@ pub fn copy_file(src: &Path, dest: &Path, sudo: bool) -> Result<()> {
         if let Some(parent) = dest.parent() {
             run_cmd("sudo", &["mkdir", "-p", &parent.to_string_lossy()])?;
         }
-        run_cmd("sudo", &["cp", "-p", &src.to_string_lossy(), &dest.to_string_lossy()])?;
+        // Preserve mode (+x) while ensuring root:root ownership
+        run_cmd(
+            "sudo",
+            &[
+                "cp",
+                "--preserve=mode",
+                &src.to_string_lossy(),
+                &dest.to_string_lossy(),
+            ],
+        )?;
+        // sudoers drop-in files must be 0440 and owned by root:root
+        if dest.starts_with("/etc/sudoers.d") {
+            run_cmd("sudo", &["chmod", "0440", &dest.to_string_lossy()])?;
+        }
     } else {
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent)

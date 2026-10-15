@@ -286,7 +286,7 @@ fn apply_changes(
     let needs_paru = selection.enabled.iter().any(|name| {
         manifest
             .find_component(name)
-            .map(|c| c.packages.iter().any(|p| !p.starts_with("local:")))
+            .map(|c| !c.packages.is_empty())
             .unwrap_or(false)
     });
     if needs_paru {
@@ -308,7 +308,12 @@ fn apply_changes(
             }
 
             if !was_deployed && !comp.post_install.is_empty() {
-                hooks::run_hooks(&comp.post_install, "post_install")?;
+                hooks::run_hooks(
+                    &comp.post_install,
+                    "post_install",
+                    active_env.as_deref(),
+                    &config.repo_dir,
+                )?;
             }
 
             if !comp.files.is_empty() {
@@ -321,7 +326,12 @@ fn apply_changes(
             }
 
             if !comp.post_deploy.is_empty() {
-                hooks::run_hooks(&comp.post_deploy, "post_deploy")?;
+                hooks::run_hooks(
+                    &comp.post_deploy,
+                    "post_deploy",
+                    active_env.as_deref(),
+                    &config.repo_dir,
+                )?;
             }
         }
         state.components.insert(name.clone(), true);
@@ -430,23 +440,48 @@ fn change_environment(
         apply_changes(config, manifest, state, sel)?;
     }
 
-    let global_with_files: Vec<_> = manifest
+    let global_to_update: Vec<_> = manifest
         .components
         .iter()
-        .filter(|c| c.environment.is_none() && state.is_enabled(&c.name) && !c.files.is_empty())
+        .filter(|c| {
+            c.environment.is_none()
+                && state.is_enabled(&c.name)
+                && (!c.files.is_empty()
+                    || c.post_install.iter().any(|h| h.environment() == new_env && new_env.is_some())
+                    || !c.post_deploy.is_empty())
+        })
         .collect();
 
-    if !global_with_files.is_empty() {
+    if !global_to_update.is_empty() {
         println!("\n  Re-deploying global components for new environment overrides...");
-        for comp in global_with_files {
+        for comp in global_to_update {
             println!(
                 "  {} {} (override update)",
                 style("[~]").yellow(),
                 comp.name
             );
-            deploy::redeploy_component_files(comp, config, state, new_env)?;
+            if !comp.files.is_empty() {
+                deploy::redeploy_component_files(comp, config, state, new_env)?;
+            }
+            // Run any post_install hooks specifically scoped to the newly activated environment
+            if new_env.is_some() {
+                let env_specific_install: Vec<_> = comp
+                    .post_install
+                    .iter()
+                    .filter(|h| h.environment() == new_env)
+                    .cloned()
+                    .collect();
+                if !env_specific_install.is_empty() {
+                    hooks::run_hooks(
+                        &env_specific_install,
+                        "post_install",
+                        new_env,
+                        &config.repo_dir,
+                    )?;
+                }
+            }
             if !comp.post_deploy.is_empty() {
-                hooks::run_hooks(&comp.post_deploy, "post_deploy")?;
+                hooks::run_hooks(&comp.post_deploy, "post_deploy", new_env, &config.repo_dir)?;
             }
         }
     }

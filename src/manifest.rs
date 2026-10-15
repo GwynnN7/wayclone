@@ -34,9 +34,9 @@ pub struct Component {
     #[serde(default)]
     pub files: Vec<FileEntry>,
     #[serde(default)]
-    pub post_install: Vec<String>,
+    pub post_install: Vec<HookEntry>,
     #[serde(default)]
-    pub post_deploy: Vec<String>,
+    pub post_deploy: Vec<HookEntry>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -50,6 +50,41 @@ pub struct FileEntry {
     /// Optional: only deploy this file when the given environment is active.
     #[serde(default, alias = "shell")]
     pub environment: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum HookEntry {
+    Simple(String),
+    Scoped {
+        cmd: String,
+        #[serde(default, alias = "shell")]
+        environment: Option<String>,
+    },
+}
+
+impl HookEntry {
+    pub fn cmd(&self) -> &str {
+        match self {
+            HookEntry::Simple(cmd) => cmd,
+            HookEntry::Scoped { cmd, .. } => cmd,
+        }
+    }
+
+    pub fn environment(&self) -> Option<&str> {
+        match self {
+            HookEntry::Simple(_) => None,
+            HookEntry::Scoped { environment, .. } => environment.as_deref(),
+        }
+    }
+
+    pub fn applies_to_environment(&self, active_environment: Option<&str>) -> bool {
+        match (self.environment(), active_environment) {
+            (None, _) => true,
+            (Some(hook_env), Some(active_env)) => hook_env == active_env,
+            (Some(_), None) => false,
+        }
+    }
 }
 
 impl FileEntry {

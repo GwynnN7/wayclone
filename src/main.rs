@@ -156,18 +156,62 @@ fn cmd_interactive(config: &AppConfig) -> Result<()> {
 
                     if let Some(selection) = menu::show_components_menu(&components, &state)? {
                         run_with_visible_output(&term, "Applying Changes", || {
-                            apply_changes(
-                                config,
-                                &manifest,
-                                &mut state,
-                                &selection,
-                            )?;
+                            apply_changes(config, &manifest, &mut state, &selection)?;
                             state.save(&config.state_file)
                         })?;
                         menu::show_completion(
                             &term,
                             "Changes Applied",
                             "Component changes completed successfully.",
+                        )?;
+                        menu::wait_for_enter()?;
+                    }
+                }
+                MainMenuAction::SyncSpecific => {
+                    let active_env = state.active_environment.clone();
+                    let components = manifest.components_for_environment(active_env.as_deref());
+
+                    if let Some(selection) = menu::show_sync_specific_menu(&components, &state)? {
+                        run_with_visible_output(&term, "Syncing Selected Components", || {
+                            apply_changes(config, &manifest, &mut state, &selection)?;
+                            state.save(&config.state_file)
+                        })?;
+                        menu::show_completion(
+                            &term,
+                            "Components Synced",
+                            "Selected components synced successfully.",
+                        )?;
+                        menu::wait_for_enter()?;
+                    }
+                }
+                MainMenuAction::UninstallSpecific => {
+                    let active_env = state.active_environment.clone();
+                    let installed_components: Vec<_> = manifest
+                        .components_for_environment(active_env.as_deref())
+                        .into_iter()
+                        .filter(|c| {
+                            state.is_enabled(&c.name) || state.deployed.contains_key(&c.name)
+                        })
+                        .collect();
+
+                    if installed_components.is_empty() {
+                        menu::show_completion(
+                            &term,
+                            "Uninstall Components",
+                            "No components are currently installed.",
+                        )?;
+                        menu::wait_for_enter()?;
+                    } else if let Some(selection) =
+                        menu::show_uninstall_menu(&installed_components, &state)?
+                    {
+                        run_with_visible_output(&term, "Uninstalling Selected Components", || {
+                            apply_changes(config, &manifest, &mut state, &selection)?;
+                            state.save(&config.state_file)
+                        })?;
+                        menu::show_completion(
+                            &term,
+                            "Components Uninstalled",
+                            "Selected components uninstalled successfully.",
                         )?;
                         menu::wait_for_enter()?;
                     }
@@ -263,6 +307,7 @@ fn sync_enabled_components(
         enabled,
         disabled: Vec::new(),
         reinstall: false,
+        skip_ask: false,
     };
     apply_changes(
         config,
@@ -478,7 +523,8 @@ fn apply_changes(
             let component = manifest.find_component(name)?;
             let already_installed =
                 state.is_enabled(&component.name) || state.deployed.contains_key(&component.name);
-            let needs_confirmation = component.ask && already_installed && !selection.reinstall;
+            let needs_confirmation = 
+                component.ask && !selection.skip_ask && already_installed && !selection.reinstall;
 
             if !needs_confirmation {
                 return Some(component.name.clone());
@@ -510,6 +556,7 @@ fn apply_changes(
         enabled,
         disabled: selection.disabled.clone(),
         reinstall: selection.reinstall,
+        skip_ask: selection.skip_ask,
     };
     let needed = !selection.reinstall;
     let active_env = state.active_environment.clone();

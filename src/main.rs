@@ -79,7 +79,7 @@ fn cmd_init(config: &AppConfig, url: &str) -> Result<()> {
     if config.manifest_path().exists() {
         if let Ok(manifest) = Manifest::load(&config.manifest_path()) {
             if !manifest.available_environments().is_empty() {
-                println!("\n{}", style("Select an initial environment:").cyan().bold());
+                println!("\n{}", style("Select an environment:").cyan().bold());
                 if let Some(env_choice) = menu::show_environment_menu(&manifest, None)? {
                     state.active_environment = env_choice;
                 }

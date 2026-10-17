@@ -101,7 +101,7 @@ fn main_menu_loop(
 
     let mut entries: Vec<(&str, MainMenuAction)> = vec![
         ("📦 Manage Components", MainMenuAction::ManageComponents),
-        ("⚡ Sync / Reinstall Specific", MainMenuAction::SyncSpecific),
+        ("⚡ Install Components", MainMenuAction::SyncSpecific),
         ("🗑️ Uninstall Components", MainMenuAction::UninstallSpecific),
     ];
     if has_envs {
@@ -237,7 +237,7 @@ fn components_menu_loop(
 
     let header_title = match mode {
         SelectionMode::Declarative => "Manage Components",
-        SelectionMode::SyncSpecific => "Sync / Reinstall Specific Components",
+        SelectionMode::SyncSpecific => "Install Components",
         SelectionMode::UninstallSpecific => "Uninstall Components",
     };
 
@@ -331,9 +331,9 @@ fn components_menu_loop(
             }
             SelectionMode::SyncSpecific => {
                 if cursor == save_idx {
-                    style("⚡ Sync Selected").green().bold()
+                    style("⚡ Install Selected").green().bold()
                 } else {
-                    style("⚡ Sync Selected").green()
+                    style("⚡ Install Selected").green()
                 }
             }
             SelectionMode::UninstallSpecific => {
